@@ -1,0 +1,83 @@
+🔥 Love the idea! You’re basically thinking of a “Secret Chat Server”:
+
+A Go server that allows anyone to connect,
+
+But conversations in a room are encrypted with a shared secret key (hash),
+
+Only clients with the key can decrypt messages — others see just gibberish.
+
+That way it feels like “open access, but private if you know the key.”
+This project will really push your Go networking + concurrency + crypto skills.
+
+📌 Step-by-Step Roadmap
+Phase 1 – Basic Chat Server (Plaintext)
+
+Create a TCP server that listens for connections.
+
+Each client runs in its own goroutine.
+
+Implement message broadcasting: when one client sends, all others in the same room receive it.
+
+Add multiple rooms (e.g., JOIN room1, JOIN room2).
+
+👉 At this point, you’ll have a working IRC-style chat in Go.
+
+Phase 2 – Add Rooms & Commands
+
+Support commands like:
+
+/join room_name → move client to a room.
+
+/rooms → list available rooms.
+
+/quit → disconnect.
+
+Store clients in a map[roomName][]client.
+
+Synchronize with mutexes or channels so goroutines don’t fight.
+
+👉 You now have proper room separation.
+
+Phase 3 – Encryption Layer
+
+When a client sends a message:
+
+It is encrypted with a shared secret key (hash).
+
+The server just forwards ciphertext (it doesn’t know the content).
+
+On receiving, clients try to decrypt using their key.
+
+If they have the right key → they see plaintext.
+
+If not → they see random gibberish.
+
+🔐 You can start simple:
+
+Use AES with a pre-shared password (entered by the client before joining).
+
+Derive a key from the password using SHA256.
+
+👉 This gives you end-to-end encrypted rooms, where the server is just a dumb pipe.
+
+Phase 4 – Hardening & Cool Features
+
+Key exchange: Instead of hardcoding, maybe let users generate a room key.
+
+Persistence: Optionally store logs encrypted (server can’t read them).
+
+WebSocket Support: Wrap it with WebSockets so a browser-based client can connect.
+
+UI: Build a simple CLI (or later React UI) that connects to your Go server.
+
+🛠️ Tech Skills You’ll Learn
+
+Networking: TCP sockets, client-server communication.
+
+Concurrency: goroutines for handling multiple clients.
+
+Synchronization: channels & mutexes for safe room/client management.
+
+Cryptography: AES, SHA256, secure message handling.
+
+⚡ This project will look really impressive on your resume because it’s not just another chat app — it’s a secure distributed system with real-world concepts (like how Signal/Telegram do encryption).
