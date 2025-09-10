@@ -39,7 +39,9 @@ func (s *Server) Start() error {
 
 	// block until quit signal is received
 	<-s.quitch
+
 	close(s.msgch)
+
 	return nil
 }
 
