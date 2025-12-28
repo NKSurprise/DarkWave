@@ -337,7 +337,6 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 		}
 		room := s.getOrCreateRoom(parts[1])
 		s.joinRoom(c, room)
-		s.sendLine(c, "** joined %s", room.Name)
 
 	case "/quit":
 		s.sendLine(c, "** bye")
