@@ -16,7 +16,21 @@ type Client struct {
 	out        chan Message
 	nick       string
 	activeRoom *Room
+	friends    []Friend
+	friendReqs []FriendRequest
 	wmu        sync.Mutex
+}
+
+type FriendRequest struct {
+	fromNick string
+	// fromID   string
+	toNick string
+	// toID     string
+}
+
+type Friend struct {
+	nick string
+	// id   string
 }
 
 type Room struct {
@@ -282,12 +296,37 @@ func (s *Server) safeWrite(c *Client, msg []byte) error {
 	return err
 }
 
+func (s *Server) sendFriendRequest(from *Client, toNick *Client) {
+	// find client by nick
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, r := range s.rooms {
+		r.mu.RLock()
+		for c := range r.clients {
+			if c.nick == toNick.nick {
+				// send friend request
+				c.friendReqs = append(c.friendReqs, FriendRequest{fromNick: from.nick, toNick: toNick.nick})
+				s.sendLine(c, "** friend request received from: %s", from.nick)
+				r.mu.RUnlock()
+				return
+			}
+		}
+		r.mu.RUnlock()
+	}
+	s.sendLine(from, "** no user with nick: %s", toNick.nick)
+}
+
 const helpText = "" +
 	"** commands **\n" +
 	"  /help                 show this help\n" +
 	"  /nick <name>          set your nickname\n" +
 	"  /rooms                list available rooms\n" +
 	"  /join <room>          join or create a room (e.g., /join main)\n" +
+	"  /friends              list your friends\n" +
+	"  /addfriend <nick>     add a friend by nickname\n" +
+	"  /friendreqs           list pending friend requests\n" +
+	"  /acceptfriend <nick>  accept a friend request\n" +
+	"  /declinefriend <nick> decline a friend request\n" +
 	"  /quit                 disconnect\n"
 
 func (s *Server) handleCommand(c *Client, cmd string) {
@@ -338,6 +377,88 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 		room := s.getOrCreateRoom(parts[1])
 		s.joinRoom(c, room)
 
+	case "/friends":
+		friends := c.friends
+		var out string
+		if len(friends) == 0 {
+			out = "** friends: (none)"
+		} else {
+			var names []string
+			for _, f := range friends {
+				names = append(names, f.nick)
+			}
+			out = "** friends: " + strings.Join(names, ", ")
+		}
+		if err := s.sendLine(c, out); err != nil {
+			fmt.Println("sendLine /friends:", err)
+		}
+	case "/addfriend":
+		if len(parts) < 2 {
+			s.sendLine(c, "usage: /addfriend <nick>")
+			return
+		}
+		nick := parts[1]
+		// id := "id-" + nick // placeholder for unique ID
+		// c.friends = append(c.friends, Friend{nick: nick})
+		// c.friendReqs = append(c.friendReqs, FriendRequest{fromNick: c.nick, toNick: nick})
+		// s.sendLine(c, "** friend request sent to: %s", nick)
+		s.sendFriendRequest(c, &Client{nick: nick})
+
+	case "/friendreqs":
+		reqs := c.friendReqs
+		var out string
+		if len(reqs) == 0 {
+			out = "** friend requests: (none)"
+		} else {
+			var names []string
+			for _, fr := range reqs {
+				names = append(names, fr.fromNick)
+			}
+			out = "** friend requests from: " + strings.Join(names, ", ")
+		}
+		if err := s.sendLine(c, out); err != nil {
+			fmt.Println("sendLine /friendreqs:", err)
+		}
+	case "/acceptfriend":
+		if len(parts) < 2 {
+			s.sendLine(c, "usage: /acceptfriend <nick>")
+			return
+		}
+		nick := parts[1]
+		var found bool
+		for i, fr := range c.friendReqs {
+			if fr.fromNick == nick {
+				found = true
+				// Add to friends list
+				c.friends = append(c.friends, Friend{nick: fr.fromNick})
+				// Remove from friend requests
+				c.friendReqs = append(c.friendReqs[:i], c.friendReqs[i+1:]...)
+				s.sendLine(c, "** accepted friend request from: %s", nick)
+				break
+			}
+		}
+		if !found {
+			s.sendLine(c, "** no friend request from: %s", nick)
+		}
+	case "/declinefriend":
+		if len(parts) < 2 {
+			s.sendLine(c, "usage: /declinefriend <nick>")
+			return
+		}
+		nick := parts[1]
+		var found bool
+		for i, fr := range c.friendReqs {
+			if fr.fromNick == nick {
+				found = true
+				// Remove from friend requests
+				c.friendReqs = append(c.friendReqs[:i], c.friendReqs[i+1:]...)
+				s.sendLine(c, "** declined friend request from: %s", nick)
+				break
+			}
+		}
+		if !found {
+			s.sendLine(c, "** no friend request from: %s", nick)
+		}
 	case "/quit":
 		s.sendLine(c, "** bye")
 		_ = c.conn.Close()
