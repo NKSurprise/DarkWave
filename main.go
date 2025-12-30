@@ -398,10 +398,6 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 			return
 		}
 		nick := parts[1]
-		// id := "id-" + nick // placeholder for unique ID
-		// c.friends = append(c.friends, Friend{nick: nick})
-		// c.friendReqs = append(c.friendReqs, FriendRequest{fromNick: c.nick, toNick: nick})
-		// s.sendLine(c, "** friend request sent to: %s", nick)
 		s.sendFriendRequest(c, &Client{nick: nick})
 
 	case "/friendreqs":
