@@ -5,10 +5,16 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+
+	"context"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/joho/godotenv"
 )
 
 type Client struct {
@@ -126,7 +132,7 @@ func (s *Server) acceptLoop() {
 
 		mainRoom := s.getOrCreateRoom("#main")
 		s.joinRoom(c, mainRoom)
-		_ = s.sendLine(c, "** connected. type /help")
+		_ = s.sendLine(c, "** connected. type /help | /?")
 
 		go s.writeLoop(c)
 		go s.readLoop(c)
@@ -318,7 +324,7 @@ func (s *Server) sendFriendRequest(from *Client, toNick *Client) {
 
 const helpText = "" +
 	"** commands **\n" +
-	"  /help                 show this help\n" +
+	"  /help | /?            show this help\n" +
 	"  /nick <name>          set your nickname\n" +
 	"  /rooms                list available rooms\n" +
 	"  /join <room>          join or create a room (e.g., /join main)\n" +
@@ -464,7 +470,39 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 	}
 }
 
+func mustEnv(key string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		log.Fatalf("missing required env var: %s", key)
+	}
+	return v
+}
+
 func main() {
+	_ = godotenv.Load()
+
+	dbURL := mustEnv("DB_URL")
+	port := os.Getenv("APP_PORT")
+	if port == "" {
+		port = ":3000"
+	}
+
+	cfg, err := pgxpool.ParseConfig(dbURL)
+	if err != nil {
+		log.Fatal("parse DB_URL:", err)
+	}
+	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		log.Fatal("connect:", err)
+	}
+	defer pool.Close()
+
+	if err := pool.Ping(context.Background()); err != nil {
+		log.Fatal("db ping failed:", err)
+	}
+
+	fmt.Println("DB connected ✅  listening on", port)
+
 	s := NewServer(":3000")
 	log.Fatal(s.Start())
 }
