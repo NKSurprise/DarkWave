@@ -531,7 +531,7 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 		} else {
 			out = "** rooms: " + strings.Join(names, ", ")
 		}
-		if err := s.sendLine(c, out); err != nil {
+		if err := s.sendLine(c, "%s", out); err != nil {
 			fmt.Println("sendLine /rooms:", err)
 		}
 	case "/nick":
@@ -582,7 +582,7 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 			}
 			out = "** friends: " + strings.Join(names, ", ")
 		}
-		if err := s.sendLine(c, out); err != nil {
+		if err := s.sendLine(c, "%s", out); err != nil {
 			fmt.Println("sendLine /friends:", err)
 		}
 	case "/addfriend":
@@ -616,7 +616,7 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 			}
 			out = "** friend requests: " + strings.Join(names, ", ")
 		}
-		if err := s.sendLine(c, out); err != nil {
+		if err := s.sendLine(c, "%s", out); err != nil {
 			fmt.Println("sendLine /friendreqs:", err)
 		}
 	case "/acceptfriend":
