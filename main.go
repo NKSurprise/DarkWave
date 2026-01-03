@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"context"
 
@@ -18,6 +19,7 @@ import (
 )
 
 type Client struct {
+	UserID     int64
 	conn       net.Conn
 	out        chan Message
 	nick       string
@@ -28,18 +30,25 @@ type Client struct {
 }
 
 type FriendRequest struct {
-	fromNick string
-	// fromID   string
-	toNick string
-	// toID     string
+	ID          int64
+	fromNick    *Client
+	toNick      *Client
+	fromID      int64  // new
+	toID        int64  // new
+	status      string // pending, accepted, declined
+	createdAt   time.Time
+	respondedAt *time.Time
 }
 
 type Friend struct {
-	nick string
-	// id   string
+	friendID  int64   // new
+	userID    int64   // new
+	friend    *Client // old
+	createdAt time.Time
 }
 
 type Room struct {
+	ID      int64
 	Name    string
 	Inbox   chan Message
 	clients map[*Client]struct{}
@@ -47,9 +56,16 @@ type Room struct {
 }
 
 type Message struct {
-	room    *Room
-	from    *Client
+	ID      int64
+	room    *Room   //old
+	from    *Client //old
+	roomID  int64   //new
+	fromID  int64   //new
 	payload []byte
+}
+
+type Repo struct {
+	pool *pgxpool.Pool
 }
 
 type Server struct {
@@ -58,19 +74,27 @@ type Server struct {
 	quitch     chan struct{}
 
 	// rooms registry
-	mu    sync.RWMutex
-	rooms map[string]*Room
+	mu            sync.RWMutex
+	rooms         map[string]*Room
+	clientsByUser map[int64]*Client
+	repo          *Repo
 
 	// global inbox (roomed messages)
 	msgch chan Message
 }
 
-func NewServer(addr string) *Server {
+func NewRepo(p *pgxpool.Pool) *Repo {
+	return &Repo{pool: p}
+}
+
+func NewServer(addr string, repo *Repo) *Server {
 	s := &Server{
-		listenAddr: addr,
-		quitch:     make(chan struct{}),
-		msgch:      make(chan Message, 1024),
-		rooms:      make(map[string]*Room),
+		listenAddr:    addr,
+		quitch:        make(chan struct{}),
+		msgch:         make(chan Message, 1024),
+		rooms:         make(map[string]*Room),
+		clientsByUser: make(map[int64]*Client),
+		repo:          repo,
 	}
 	// create #main with a bigger buffer (absorbs bursts)
 	s.rooms["#main"] = &Room{
@@ -257,17 +281,33 @@ func (s *Server) readLoop(c *Client) {
 			continue
 		}
 
-		if !strings.HasPrefix(text, "/") {
-			// copy payload so the buffer isn't reused
-			payload := append([]byte(nil), []byte(text)...)
-			s.msgch <- Message{room: c.activeRoom, from: c, payload: payload}
+		if c.UserID == 0 {
+			s.sendLine(c, "** set your nick first with /nick <name>")
+			continue
+		}
+		if c.activeRoom == nil {
+			s.sendLine(c, "** join a room first with /join <room>")
 			continue
 		}
 
-		// normal chat: keep \n so PS ReadLine() prints
-		payload := append([]byte(nil), []byte(text)...)
-		s.msgch <- Message{room: c.activeRoom, from: c, payload: payload}
+		body := text
+		roomID := c.activeRoom.ID
+		userID := c.UserID
 
+		go func(roomId, userId int64, body string) {
+			if s.repo != nil {
+				return
+			}
+
+			if _, err := s.repo.AddMessage(context.Background(), roomID, userID, body); err != nil {
+				fmt.Println("db add message error:", err)
+			}
+
+		}(roomID, userID, body)
+
+		out := append([]byte(nil), (body + "\n")...)
+
+		s.msgch <- Message{room: c.activeRoom, from: c, payload: out}
 	}
 }
 
@@ -278,7 +318,6 @@ func (s *Server) writeLoop(c *Client) {
 			return
 		}
 	}
-
 }
 
 func (s *Server) sendLine(c *Client, format string, args ...any) error {
@@ -302,24 +341,157 @@ func (s *Server) safeWrite(c *Client, msg []byte) error {
 	return err
 }
 
-func (s *Server) sendFriendRequest(from *Client, toNick *Client) {
-	// find client by nick
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for _, r := range s.rooms {
-		r.mu.RLock()
-		for c := range r.clients {
-			if c.nick == toNick.nick {
-				// send friend request
-				c.friendReqs = append(c.friendReqs, FriendRequest{fromNick: from.nick, toNick: toNick.nick})
-				s.sendLine(c, "** friend request received from: %s", from.nick)
-				r.mu.RUnlock()
-				return
-			}
-		}
-		r.mu.RUnlock()
+func (s *Server) registerClientSingle(c *Client) {
+	s.mu.Lock()
+	if old := s.clientsByUser[c.UserID]; old != nil && old != c {
+		_ = s.sendLine(old, "** you were logged out (new login elsewhere)")
+		_ = old.conn.Close() // triggers its cleanup defer
 	}
-	s.sendLine(from, "** no user with nick: %s", toNick.nick)
+	s.clientsByUser[c.UserID] = c
+	s.mu.Unlock()
+}
+
+func (s *Server) unregisterClientSingle(c *Client) {
+	s.mu.Lock()
+	if s.clientsByUser[c.UserID] == c {
+		delete(s.clientsByUser, c.UserID)
+	}
+	s.mu.Unlock()
+}
+
+func (s *Server) onlineByUserID(userID int64) (*Client, bool) {
+	s.mu.RLock()
+	cc, ok := s.clientsByUser[userID]
+	s.mu.RUnlock()
+	return cc, ok
+}
+
+func (r *Repo) UpsertClientByNick(ctx context.Context, nick string) (id int64, retNick string, err error) {
+	err = r.pool.QueryRow(ctx, `
+        insert into clients(nick) values ($1)
+        on conflict(nick) do update set nick = excluded.nick
+        returning id, nick
+    `, nick).Scan(&id, &retNick)
+	return
+}
+
+// create-or-get room by name
+func (r *Repo) UpsertRoomByName(ctx context.Context, name string) (id int64, retName string, err error) {
+	err = r.pool.QueryRow(ctx, `
+        insert into rooms(name) values ($1)
+        on conflict(name) do update set name = excluded.name
+        returning id, name
+    `, name).Scan(&id, &retName)
+	return
+}
+
+// store a chat message
+func (r *Repo) AddMessage(ctx context.Context, roomID, clientID int64, body string) (int64, error) {
+	var id int64
+	err := r.pool.QueryRow(ctx, `
+        insert into messages(room_id, client_id, body)
+        values ($1,$2,$3)
+        returning id
+    `, roomID, clientID, body).Scan(&id)
+	return id, err
+}
+
+func (r *Repo) declineFriendRequest(ctx context.Context, fromID, toID int64) error {
+	_, err := r.pool.Exec(ctx, `
+		update friend_requests
+		set status = 'declined', responded_at = now()
+		where from_id = $1 and to_id = $2 and status = 'pending'
+	`, fromID, toID)
+	return err
+}
+
+func (r *Repo) addFriend(ctx context.Context, fromID, toID int64) error {
+	_, err := r.pool.Exec(ctx, `
+		insert into friends(user_id, friend_id, created_at)
+		values ($1, $2, now())
+	`, fromID, toID)
+	return err
+}
+
+func (r *Repo) acceptFriendRequest(ctx context.Context, fromID, toID int64) error {
+	_, err := r.pool.Exec(ctx, `
+		update friend_requests
+		set status = 'accepted', responded_at = now()
+		where from_id = $1 and to_id = $2 and status = 'pending'
+	`, fromID, toID)
+
+	return err
+}
+
+func (r *Repo) getFriendsByUserID(ctx context.Context, userID int64) ([]Friend, error) {
+	rows, err := r.pool.Query(ctx, `
+		select friend_id, created_at from friends where user_id = $1
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var friends []Friend
+	for rows.Next() {
+		var f Friend
+		if err := rows.Scan(&f.friendID, &f.createdAt); err != nil {
+			return nil, err
+		}
+		friends = append(friends, f)
+	}
+	return friends, nil
+}
+
+func (r *Repo) getFriendRequestsByUserID(ctx context.Context, userID int64) ([]FriendRequest, error) {
+	rows, err := r.pool.Query(ctx, `
+		select id, from_id, to_id, status, created_at, responded_at
+		from friend_requests
+		where to_id = $1 and status = 'pending'
+	`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var requests []FriendRequest
+	for rows.Next() {
+		var fr FriendRequest
+		if err := rows.Scan(&fr.ID, &fr.fromID, &fr.toID, &fr.status, &fr.createdAt, &fr.respondedAt); err != nil {
+			return nil, err
+		}
+		requests = append(requests, fr)
+	}
+	return requests, nil
+}
+
+func (r *Repo) sendFriendRequest(fromID, toID int64) error {
+	_, err := r.pool.Exec(context.Background(), `
+		insert into friend_requests(from_id, to_id, status, created_at)
+		values ($1, $2, 'pending', now())
+	`, fromID, toID)
+	return err
+}
+
+func (r *Repo) findClientIDByNick(nick string) (int64, error) {
+	var id int64
+	err := r.pool.QueryRow(context.Background(), `
+		select id from clients where nick = $1
+	`, nick).Scan(&id)
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+func (r *Repo) getClientByID(ctx context.Context, id int64) (*Client, error) {
+	var nick string
+	err := r.pool.QueryRow(ctx, `
+		select nick from clients where id = $1
+	`, id).Scan(&nick)
+	if err != nil {
+		return nil, err
+	}
+	return &Client{UserID: id, nick: nick}, nil
 }
 
 const helpText = "" +
@@ -362,36 +534,51 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 		if err := s.sendLine(c, out); err != nil {
 			fmt.Println("sendLine /rooms:", err)
 		}
-
 	case "/nick":
 		if len(parts) < 2 {
 			s.sendLine(c, "usage: /nick <name>")
 			return
 		}
-		old := c.nick
-		c.nick = parts[1]
-
-		if err := s.sendLine(c, fmt.Sprintf("** nick: %s -> %s", old, c.nick)); err != nil {
-			fmt.Println("sendLine /nick:", err)
+		id, retNick, err := s.repo.UpsertClientByNick(context.Background(), parts[1])
+		if err != nil {
+			s.sendLine(c, "** error setting nick: %v", err)
+			return
 		}
 
+		old := c.nick
+		c.nick = retNick
+		c.UserID = id
+		s.sendLine(c, "** nick: %s -> %s (#%d)", old, retNick, id)
 	case "/join":
 		if len(parts) < 2 {
 			s.sendLine(c, "usage: /join <room>")
 			return
 		}
-		room := s.getOrCreateRoom(parts[1])
-		s.joinRoom(c, room)
+		id, retName, err := s.repo.UpsertRoomByName(context.Background(), parts[1])
+		if err != nil {
+			s.sendLine(c, "** error: %v", err)
+			return
+		}
 
+		room := s.getOrCreateRoom(retName)
+		room.ID = id
+		room.Name = retName
+		s.joinRoom(c, room)
+		s.sendLine(c, "** joined %s", room.Name)
 	case "/friends":
-		friends := c.friends
+		friends, err := s.repo.getFriendsByUserID(context.Background(), c.UserID)
+
+		if err != nil {
+			s.sendLine(c, "** error fetching friends: %v", err)
+			return
+		}
 		var out string
 		if len(friends) == 0 {
 			out = "** friends: (none)"
 		} else {
 			var names []string
 			for _, f := range friends {
-				names = append(names, f.nick)
+				names = append(names, f.friend.nick)
 			}
 			out = "** friends: " + strings.Join(names, ", ")
 		}
@@ -404,63 +591,63 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 			return
 		}
 		nick := parts[1]
-		s.sendFriendRequest(c, &Client{nick: nick})
 
+		toID, err := s.repo.findClientIDByNick(nick)
+		if err != nil {
+			s.sendLine(c, "** no user with nick: %s", nick)
+			return
+		}
+		s.repo.sendFriendRequest(c.UserID, toID)
+		s.sendLine(c, "** friend request sent to: %s", nick)
 	case "/friendreqs":
-		reqs := c.friendReqs
+
+		reqs, err := s.repo.getFriendRequestsByUserID(context.Background(), c.UserID)
+		if err != nil {
+			s.sendLine(c, "** error fetching friend requests: %v", err)
+			return
+		}
 		var out string
 		if len(reqs) == 0 {
 			out = "** friend requests: (none)"
 		} else {
 			var names []string
 			for _, fr := range reqs {
-				names = append(names, fr.fromNick)
+				names = append(names, fr.fromNick.nick)
 			}
-			out = "** friend requests from: " + strings.Join(names, ", ")
+			out = "** friend requests: " + strings.Join(names, ", ")
 		}
 		if err := s.sendLine(c, out); err != nil {
 			fmt.Println("sendLine /friendreqs:", err)
 		}
 	case "/acceptfriend":
-		if len(parts) < 2 {
-			s.sendLine(c, "usage: /acceptfriend <nick>")
+
+		nick := parts[1]
+		fromID, err := s.repo.findClientIDByNick(nick)
+		if err != nil {
+			s.sendLine(c, "** no user with nick: %s", nick)
 			return
 		}
-		nick := parts[1]
-		var found bool
-		for i, fr := range c.friendReqs {
-			if fr.fromNick == nick {
-				found = true
-				// Add to friends list
-				c.friends = append(c.friends, Friend{nick: fr.fromNick})
-				// Remove from friend requests
-				c.friendReqs = append(c.friendReqs[:i], c.friendReqs[i+1:]...)
-				s.sendLine(c, "** accepted friend request from: %s", nick)
-				break
-			}
+		if err := s.repo.acceptFriendRequest(context.Background(), fromID, c.UserID); err != nil {
+			s.sendLine(c, "** error accepting friend request from: %s", nick)
+			return
 		}
-		if !found {
-			s.sendLine(c, "** no friend request from: %s", nick)
+		if err := s.repo.addFriend(context.Background(), fromID, c.UserID); err != nil {
+			s.sendLine(c, "** error adding friend: %s", nick)
+			return
 		}
+		s.sendLine(c, "** accepted friend request from: %s", nick)
 	case "/declinefriend":
-		if len(parts) < 2 {
-			s.sendLine(c, "usage: /declinefriend <nick>")
+		nick := parts[1]
+		fromID, err := s.repo.findClientIDByNick(nick)
+		if err != nil {
+			s.sendLine(c, "** no user with nick: %s", nick)
 			return
 		}
-		nick := parts[1]
-		var found bool
-		for i, fr := range c.friendReqs {
-			if fr.fromNick == nick {
-				found = true
-				// Remove from friend requests
-				c.friendReqs = append(c.friendReqs[:i], c.friendReqs[i+1:]...)
-				s.sendLine(c, "** declined friend request from: %s", nick)
-				break
-			}
+		if err := s.repo.declineFriendRequest(context.Background(), fromID, c.UserID); err != nil {
+			s.sendLine(c, "** error declining friend request from: %s", nick)
+			return
 		}
-		if !found {
-			s.sendLine(c, "** no friend request from: %s", nick)
-		}
+		s.sendLine(c, "** declined friend request from: %s", nick)
 	case "/quit":
 		s.sendLine(c, "** bye")
 		_ = c.conn.Close()
@@ -503,6 +690,8 @@ func main() {
 
 	fmt.Println("DB connected ✅  listening on", port)
 
-	s := NewServer(":3000")
+	repo := NewRepo(pool)
+
+	s := NewServer(":3000", repo)
 	log.Fatal(s.Start())
 }
