@@ -48,6 +48,7 @@ type Client struct {
 	conn       net.Conn
 	out        chan Message
 	nick       string
+	password   string
 	activeRoom *Room
 	friends    []Friend
 	friendReqs []FriendRequest
@@ -391,13 +392,14 @@ func (s *Server) onlineByUserID(userID int64) (*Client, bool) {
 	return cc, ok
 }
 
+// create-or-get client by nick
 func (r *Repo) UpsertClientByNick(ctx context.Context, nick string) (id int64, retNick string, err error) {
 	err = r.pool.QueryRow(ctx, `
         insert into clients(nick) values ($1)
         on conflict(nick) do update set nick = excluded.nick
         returning id, nick
     `, nick).Scan(&id, &retNick)
-	return
+	return id, retNick, err
 }
 
 // create-or-get room by name
@@ -407,7 +409,7 @@ func (r *Repo) UpsertRoomByName(ctx context.Context, name string) (id int64, ret
         on conflict(name) do update set name = excluded.name
         returning id, name
     `, name).Scan(&id, &retName)
-	return
+	return id, retName, err
 }
 
 // store a chat message
@@ -508,6 +510,17 @@ func (r *Repo) findClientIDByNick(nick string) (int64, error) {
 	return id, nil
 }
 
+func (r *Repo) checkClientHasPassword(ctx context.Context, id int64) (bool, error) {
+	var storedHash string
+	err := r.pool.QueryRow(ctx, `
+		select password from clients where id = $1
+	`, id).Scan(&storedHash)
+	if err != nil {
+		return false, err
+	}
+	return storedHash != "", nil
+}
+
 func (r *Repo) getClientByID(ctx context.Context, id int64) (*Client, error) {
 	var nick string
 	err := r.pool.QueryRow(ctx, `
@@ -516,12 +529,11 @@ func (r *Repo) getClientByID(ctx context.Context, id int64) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{UserID: id, nick: nick}, nil
+	return &Client{UserID: id, nick: nick, password: ""}, nil
 }
 
 func HashPassword(password string, p *Argon2Params) (encodedHash string, err error) {
 	salt := make([]byte, p.SaltLength)
-	_, err = rand.Read(salt)
 	if _, err := rand.Read(salt); err != nil {
 		return "", err
 	}
@@ -535,49 +547,61 @@ func HashPassword(password string, p *Argon2Params) (encodedHash string, err err
 	return encodedHash, nil
 }
 
-func VerifyPassword(password, encodedHash string) (match bool, err error) {
+func VerifyPassword(password, encodedHash string) (bool, error) {
+	if password == "" {
+		return false, errors.New("empty password")
+	}
+	if strings.TrimSpace(encodedHash) == "" {
+		return false, errors.New("empty stored hash")
+	}
+
 	p, salt, expectedHash, err := DecodeHash(encodedHash)
 	if err != nil {
 		return false, err
 	}
-	hash := argon2.IDKey([]byte(password), salt, p.Iterations, p.Memory, p.Parallelism, p.KeyLength)
+	if len(salt) < 8 {
+		return false, errors.New("bad salt")
+	}
+	if len(expectedHash) == 0 {
+		return false, errors.New("bad hash")
+	}
 
-	if subtle.ConstantTimeCompare(hash, expectedHash) == 1 {
+	// Use the stored hash length as the key length to derive for verification
+	keyLen := uint32(len(expectedHash))
+	key := argon2.IDKey([]byte(password), salt, p.Iterations, p.Memory, p.Parallelism, keyLen)
+
+	if subtle.ConstantTimeCompare(key, expectedHash) == 1 {
 		return true, nil
 	}
 	return false, nil
 }
 
 func DecodeHash(encodedHash string) (Argon2Params, []byte, []byte, error) {
-	// Expected: $argon2id$v=19$m=65536,t=3,p=1$<salt>$<hash>
-	parts := strings.Split(encodedHash, "$")
-
+	// Expected: $argon2id$v=19$m=65536,t=3,p=2$<saltB64>$<hashB64>
+	parts := strings.Split(strings.TrimSpace(encodedHash), "$")
 	if len(parts) != 6 || parts[1] != "argon2id" {
 		return Argon2Params{}, nil, nil, errors.New("invalid encoded hash format")
 	}
-
-	// parts[2] is like "v=19" (ignore except for sanity)
 	if parts[2] != "v=19" {
 		return Argon2Params{}, nil, nil, errors.New("unsupported argon2 version")
 	}
 
-	// parts[3] is like "m=65536,t=3,p=1"
+	// Parse m=...,t=...,p=...
 	var p Argon2Params
-	pieces := strings.Split(parts[3], ",")
-	if len(pieces) != 3 {
+	items := strings.Split(parts[3], ",")
+	if len(items) != 3 {
 		return Argon2Params{}, nil, nil, errors.New("invalid argon2 parameters")
 	}
-
 	var err error
-	p.Memory, err = parseUint32KV(pieces[0], "m")
+	p.Memory, err = parseUint32KV(items[0], "m")
 	if err != nil {
 		return Argon2Params{}, nil, nil, err
 	}
-	p.Iterations, err = parseUint32KV(pieces[1], "t")
+	p.Iterations, err = parseUint32KV(items[1], "t")
 	if err != nil {
 		return Argon2Params{}, nil, nil, err
 	}
-	par, err := parseUint32KV(pieces[2], "p")
+	par, err := parseUint32KV(items[2], "p")
 	if err != nil {
 		return Argon2Params{}, nil, nil, err
 	}
@@ -596,6 +620,9 @@ func DecodeHash(encodedHash string) (Argon2Params, []byte, []byte, error) {
 		return Argon2Params{}, nil, nil, errors.New("invalid hash b64")
 	}
 
+	// Set key length from stored hash length
+	p.KeyLength = uint32(len(hash))
+
 	return p, salt, hash, nil
 }
 
@@ -609,6 +636,53 @@ func parseUint32KV(s, key string) (uint32, error) {
 		return 0, err
 	}
 	return uint32(n), nil
+}
+
+func (s *Server) readLoopPassword(c *Client) (string, error) {
+
+	r := bufio.NewReader(c.conn)
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return "** error: %s", err
+	}
+
+	passwordPlainText := cleanInput(line)
+	if passwordPlainText == "" {
+		for i := 0; 5 <= len(passwordPlainText); i++ {
+			// Simulate password input processing
+
+			passwordPlainText, err = r.ReadString('\n')
+			if err != nil {
+				return "** error: %s", err
+			}
+		}
+	}
+
+	return passwordPlainText, nil
+}
+
+func (r *Repo) SavePassword(password string, id int64) (bool, error) {
+	isSaved := true
+
+	err := r.pool.QueryRow(context.Background(), `
+		update clients set password = $1 where id = $2
+	`, password, id).Scan(&password)
+	if err != nil {
+		return false, err
+	}
+
+	return isSaved, nil
+}
+
+func (r *Repo) GetPasswordById(id int64) (string, error) {
+	var password string
+	err := r.pool.QueryRow(context.Background(), `
+		select password from clients where id = $1
+	`, id).Scan(&password)
+	if err != nil {
+		return "", err
+	}
+	return password, nil
 }
 
 const helpText = "" +
@@ -662,9 +736,77 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 			return
 		}
 
-		old := c.nick
-		c.nick = retNick
-		c.UserID = id
+		user, err := s.repo.getClientByID(context.Background(), id)
+		if err != nil {
+			s.sendLine(c, "** error fetching client: %v", err)
+			return
+		}
+
+		//input password
+		s.sendLine(c, "** enter password for %s:", retNick)
+		s.sendLine(c, "** password should be at least 5 characters")
+		passwordPlainText, err := s.readLoopPassword(c)
+		if err != nil {
+			s.sendLine(c, "** error reading password: %s", err)
+			return
+		}
+
+		//check if client has password already
+		userHasPassword, err := s.repo.checkClientHasPassword(context.Background(), id)
+		if err != nil {
+			s.sendLine(c, "** error checking password: %s", err)
+			return
+		}
+
+		var old string
+		//has a password already
+		if !userHasPassword {
+			old = user.nick
+			user.nick = retNick
+			user.UserID = id
+
+			//hashing plain text password
+			password, err := HashPassword(passwordPlainText, param)
+			if err != nil {
+				s.sendLine(c, "** error hashing password: %s", err)
+				return
+			}
+
+			s.repo.SavePassword(password, id)
+		} else {
+			dbPassword, err := s.repo.GetPasswordById(id)
+			if err != nil {
+				s.sendLine(c, "** error fetching stored password: %s", err)
+				return
+			}
+
+			correctPassword, err := VerifyPassword(passwordPlainText, dbPassword)
+			if err != nil {
+				s.sendLine(c, "** error verifying password: %s", err)
+				return
+			}
+
+			if !correctPassword {
+				for {
+					match, err := VerifyPassword(passwordPlainText, dbPassword)
+					if err != nil {
+						s.sendLine(c, "** error verifying password: %s", err)
+						return
+					}
+					if match {
+						break
+					}
+					s.sendLine(c, "** please re-enter password for %s:", retNick)
+					passwordPlainText, err = s.readLoopPassword(c)
+					if err != nil {
+						s.sendLine(c, "** error reading password: %s", err)
+						return
+					}
+				}
+				return
+			}
+		}
+
 		s.sendLine(c, "** nick: %s -> %s (#%d)", old, retNick, id)
 	case "/join":
 		if len(parts) < 2 {
