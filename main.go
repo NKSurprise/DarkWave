@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	argon2stuff "darkwave/passwordHandling"
 	"fmt"
 	"log"
 	"net"
@@ -766,7 +767,7 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 			user.UserID = id
 
 			//hashing plain text password
-			password, err := HashPassword(passwordPlainText, param)
+			password, err := argon2stuff.HashPassword(passwordPlainText, (*argon2stuff.Argon2Params)(param))
 			if err != nil {
 				s.sendLine(c, "** error hashing password: %s", err)
 				return
