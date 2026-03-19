@@ -96,6 +96,12 @@ type DBMessage struct {
 	SentAt time.Time
 }
 
+type MessageWithSender struct {
+	Body   string
+	SentAt time.Time
+	Nick   string
+}
+
 type Repo struct {
 	pool *pgxpool.Pool
 }
@@ -332,7 +338,6 @@ func (s *Server) readLoop(c *Client) {
 
 		if c.UserID == 0 {
 			s.sendLine(c, "** set your nick first with /nick <name>")
-			s.sendLine(c, "** id: %d", c.UserID)
 			continue
 		}
 		if c.activeRoom == nil {
@@ -340,22 +345,7 @@ func (s *Server) readLoop(c *Client) {
 			continue
 		}
 
-		body := text
-		roomID := c.activeRoom.ID
-		userID := c.UserID
-
-		go func(roomId, userId int64, body string) {
-			if s.repo != nil {
-				return
-			}
-
-			if _, err := s.repo.AddMessage(context.Background(), roomID, userID, body); err != nil {
-				fmt.Println("db add message error:", err)
-			}
-
-		}(roomID, userID, body)
-
-		out := append([]byte(nil), (body + "\n")...)
+		out := append([]byte(nil), (text + "\n")...)
 
 		s.msgch <- Message{room: c.activeRoom, from: c, payload: out}
 	}
@@ -434,17 +424,6 @@ func (r *Repo) UpsertRoomByName(ctx context.Context, name string) (id int64, ret
         returning id, name
     `, name).Scan(&id, &retName)
 	return id, retName, err
-}
-
-// store a chat message
-func (r *Repo) AddMessage(ctx context.Context, roomID, clientID int64, body string) (int64, error) {
-	var id int64
-	err := r.pool.QueryRow(ctx, `
-        insert into messages(room_id, client_id, body)
-        values ($1,$2,$3)
-        returning id
-    `, roomID, clientID, body).Scan(&id)
-	return id, err
 }
 
 func (r *Repo) declineFriendRequest(ctx context.Context, fromID, toID int64) error {
@@ -685,17 +664,11 @@ func (s *Server) readLoopPassword(c *Client) (string, error) {
 	return passwordPlainText, nil
 }
 
-func (r *Repo) SavePassword(password string, id int64) (bool, error) {
-	isSaved := true
-
-	err := r.pool.QueryRow(context.Background(), `
-		update clients set password = $1 where id = $2
-	`, password, id).Scan(&password)
-	if err != nil {
-		return false, err
-	}
-
-	return isSaved, nil
+func (r *Repo) SavePassword(password string, id int64) error {
+	_, err := r.pool.Exec(context.Background(), `
+		UPDATE clients SET password = $1 WHERE id = $2
+	`, password, id)
+	return err
 }
 
 func (r *Repo) GetPasswordById(id int64) (string, error) {
@@ -738,6 +711,31 @@ func (r *Repo) GetRecentMessages(roomID int64) ([]DBMessage, error) {
 	for rows.Next() {
 		var m DBMessage
 		if err := rows.Scan(&m.ID, &m.RoomID, &m.FromID, &m.Body, &m.SentAt); err != nil {
+			return nil, err
+		}
+		msgs = append(msgs, m)
+	}
+	return msgs, nil
+}
+
+func (r *Repo) GetRecentMessagesWithUsers(roomID int64) ([]MessageWithSender, error) {
+	rows, err := r.pool.Query(context.Background(), `
+		SELECT m.body, m.sent_at, c.nick
+		FROM messages m
+		JOIN clients c ON m.from_id = c.id
+		WHERE m.room_id = $1
+		ORDER BY m.sent_at DESC
+		LIMIT 50
+	`, roomID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var msgs []MessageWithSender
+	for rows.Next() {
+		var m MessageWithSender
+		if err := rows.Scan(&m.Body, &m.SentAt, &m.Nick); err != nil {
 			return nil, err
 		}
 		msgs = append(msgs, m)
@@ -823,8 +821,6 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 		}
 
 		var old string
-		c.nick = retNick
-		c.UserID = id
 		//has a password already
 		if !userHasPassword {
 			old = user.nick
@@ -840,7 +836,10 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 				return
 			}
 
-			s.repo.SavePassword(password, id)
+			if err := s.repo.SavePassword(password, id); err != nil {
+				s.sendLine(c, "** error saving password: %v", err)
+				return
+			}
 		} else {
 			c.nick = user.nick
 			c.UserID = user.UserID
@@ -850,30 +849,21 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 				return
 			}
 
-			correctPassword, err := VerifyPassword(passwordPlainText, dbPassword)
-			if err != nil {
-				s.sendLine(c, "** error verifying password: %s", err)
-				return
-			}
-
-			if !correctPassword {
-				for {
-					match, err := VerifyPassword(passwordPlainText, dbPassword)
-					if err != nil {
-						s.sendLine(c, "** error verifying password: %s", err)
-						return
-					}
-					if match {
-						break
-					}
-					s.sendLine(c, "** please re-enter password for %s:", retNick)
-					passwordPlainText, err = s.readLoopPassword(c)
-					if err != nil {
-						s.sendLine(c, "** error reading password: %s", err)
-						return
-					}
+			for {
+				match, err := VerifyPassword(passwordPlainText, dbPassword)
+				if err != nil {
+					s.sendLine(c, "** error verifying password: %s", err)
+					return
 				}
-				return
+				if match {
+					break
+				}
+				s.sendLine(c, "** please re-enter password for %s:", retNick)
+				passwordPlainText, err = s.readLoopPassword(c)
+				if err != nil {
+					s.sendLine(c, "** error reading password: %s", err)
+					return
+				}
 			}
 		}
 
@@ -898,17 +888,12 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 		s.joinRoom(c, room)
 		s.sendLine(c, "** joined %s", room.Name)
 		// load recent messages
-		msgs, err := s.repo.GetRecentMessages(room.ID)
+		msgs, err := s.repo.GetRecentMessagesWithUsers(room.ID)
 		if err != nil {
 			s.sendLine(c, "** error fetching recent messages: %v", err)
 		} else {
 			for _, msg := range msgs {
-				sender, err := s.repo.getClientByID(context.Background(), msg.FromID)
-				if err != nil {
-					s.sendLine(c, "[%s] unknown: %s", msg.SentAt.Format("15:04"), msg.Body)
-				} else {
-					s.sendLine(c, "[%s] %s: %s", msg.SentAt.Format("15:04"), sender.nick, msg.Body)
-				}
+				s.sendLine(c, "[%s] %s: %s", msg.SentAt.Format("15:04"), msg.Nick, msg.Body)
 			}
 		}
 	case "/friends":
@@ -967,6 +952,11 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 		}
 	case "/acceptfriend":
 
+		if len(parts) < 2 {
+			s.sendLine(c, "usage: /acceptfriend <nick>")
+			return
+		}
+
 		nick := parts[1]
 		fromID, err := s.repo.findClientIDByNick(nick)
 		if err != nil {
@@ -983,6 +973,12 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 		}
 		s.sendLine(c, "** accepted friend request from: %s", nick)
 	case "/declinefriend":
+
+		if len(parts) < 2 {
+			s.sendLine(c, "usage: /declinefriend <nick>")
+			return
+		}
+
 		nick := parts[1]
 		fromID, err := s.repo.findClientIDByNick(nick)
 		if err != nil {
