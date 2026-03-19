@@ -7,7 +7,6 @@ import (
 	"log"
 	"net"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -84,11 +83,17 @@ type Room struct {
 
 type Message struct {
 	ID      int64
-	room    *Room   //old
-	from    *Client //old
-	roomID  int64   //new
-	fromID  int64   //new
+	room    *Room
+	from    *Client
 	payload []byte
+}
+
+type DBMessage struct {
+	ID     int64
+	RoomID int64
+	FromID int64
+	Body   string
+	SentAt time.Time
 }
 
 type Repo struct {
@@ -125,6 +130,7 @@ func NewServer(addr string, repo *Repo) *Server {
 	}
 	// create #main with a bigger buffer (absorbs bursts)
 	s.rooms["#main"] = &Room{
+		ID:      1,
 		Name:    "#main",
 		Inbox:   make(chan Message, 1024),
 		clients: make(map[*Client]struct{}),
@@ -214,8 +220,16 @@ func (s *Server) getOrCreateRoom(name string) *Room {
 
 func (s *Server) dispatchLoop() {
 	for m := range s.msgch {
+
+		go func(msg Message) {
+			if err := s.repo.SaveMessage(msg); err != nil {
+				fmt.Println("failed to save message:", err)
+			}
+		}(m)
+
 		// forward to the room’s inbox (copy is already done in readLoop)
 		m.room.Inbox <- m
+
 		// server-side log
 		from := m.from.nick
 		fmt.Printf("[%s] (%s) %s", m.room.Name, from, string(m.payload))
@@ -255,15 +269,23 @@ func (s *Server) joinRoom(c *Client, r *Room) {
 	s.sendLine(c, "** joined %s", r.Name) // newline guaranteed
 }
 
-func (s *Server) listRooms() []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	names := make([]string, 0, len(s.rooms))
-	for n := range s.rooms {
-		names = append(names, n)
+func (r *Repo) listRooms() ([]string, error) {
+	rows, err := r.pool.Query(context.Background(), `
+		select name from rooms order by name
+	`)
+	if err != nil {
+		return nil, err
 	}
-	sort.Strings(names)
-	return names
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, nil
 }
 
 func cleanInput(s string) string {
@@ -310,6 +332,7 @@ func (s *Server) readLoop(c *Client) {
 
 		if c.UserID == 0 {
 			s.sendLine(c, "** set your nick first with /nick <name>")
+			s.sendLine(c, "** id: %d", c.UserID)
 			continue
 		}
 		if c.activeRoom == nil {
@@ -686,6 +709,42 @@ func (r *Repo) GetPasswordById(id int64) (string, error) {
 	return password, nil
 }
 
+func (r *Repo) SaveMessage(msg Message) error {
+	_, err := r.pool.Exec(context.Background(), `
+		INSERT INTO messages (room_id, from_id, body)
+		VALUES ($1, $2, $3)
+	`,
+		msg.room.ID,
+		msg.from.UserID,
+		string(msg.payload),
+	)
+	return err
+}
+
+func (r *Repo) GetRecentMessages(roomID int64) ([]DBMessage, error) {
+	rows, err := r.pool.Query(context.Background(), `
+		SELECT id, room_id, from_id, body, sent_at
+		FROM messages
+		WHERE room_id = $1
+		ORDER BY sent_at DESC
+		LIMIT 50
+	`, roomID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var msgs []DBMessage
+	for rows.Next() {
+		var m DBMessage
+		if err := rows.Scan(&m.ID, &m.RoomID, &m.FromID, &m.Body, &m.SentAt); err != nil {
+			return nil, err
+		}
+		msgs = append(msgs, m)
+	}
+	return msgs, nil
+}
+
 const helpText = "" +
 	"** commands **\n" +
 	"  /help | /?            show this help\n" +
@@ -716,7 +775,11 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 		}
 
 	case "/rooms":
-		names := s.listRooms()
+		names, err := s.repo.listRooms()
+		if err != nil {
+			s.sendLine(c, "** error: %v", err)
+			return
+		}
 		var out string
 		if len(names) == 0 {
 			out = "** rooms: (none)"
@@ -760,11 +823,15 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 		}
 
 		var old string
+		c.nick = retNick
+		c.UserID = id
 		//has a password already
 		if !userHasPassword {
 			old = user.nick
 			user.nick = retNick
 			user.UserID = id
+			c.nick = retNick
+			c.UserID = id
 
 			//hashing plain text password
 			password, err := argon2stuff.HashPassword(passwordPlainText, (*argon2stuff.Argon2Params)(param))
@@ -775,6 +842,8 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 
 			s.repo.SavePassword(password, id)
 		} else {
+			c.nick = user.nick
+			c.UserID = user.UserID
 			dbPassword, err := s.repo.GetPasswordById(id)
 			if err != nil {
 				s.sendLine(c, "** error fetching stored password: %s", err)
@@ -808,7 +877,10 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 			}
 		}
 
+		s.sendLine(c, "** welcome, %s!", retNick)
+		s.registerClientSingle(c)
 		s.sendLine(c, "** nick: %s -> %s (#%d)", old, retNick, id)
+		s.sendLine(c, "** id: %d", c.UserID)
 	case "/join":
 		if len(parts) < 2 {
 			s.sendLine(c, "usage: /join <room>")
@@ -825,6 +897,20 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 		room.Name = retName
 		s.joinRoom(c, room)
 		s.sendLine(c, "** joined %s", room.Name)
+		// load recent messages
+		msgs, err := s.repo.GetRecentMessages(room.ID)
+		if err != nil {
+			s.sendLine(c, "** error fetching recent messages: %v", err)
+		} else {
+			for _, msg := range msgs {
+				sender, err := s.repo.getClientByID(context.Background(), msg.FromID)
+				if err != nil {
+					s.sendLine(c, "[%s] unknown: %s", msg.SentAt.Format("15:04"), msg.Body)
+				} else {
+					s.sendLine(c, "[%s] %s: %s", msg.SentAt.Format("15:04"), sender.nick, msg.Body)
+				}
+			}
+		}
 	case "/friends":
 		friends, err := s.repo.getFriendsByUserID(context.Background(), c.UserID)
 
