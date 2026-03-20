@@ -46,7 +46,7 @@ var param = &Argon2Params{
 type Client struct {
 	UserID     int64
 	conn       net.Conn
-	out        chan Message
+	out        chan string
 	nick       string
 	password   string
 	activeRoom *Room
@@ -195,13 +195,23 @@ func (s *Server) acceptLoop(ctx context.Context) {
 		_ = host
 		c := &Client{
 			conn: conn,
-			out:  make(chan Message, 32),
+			out:  make(chan string, 32),
 			nick: "guest-" + port,
 		}
 
 		mainRoom := s.getOrCreateRoom("#main")
 		s.joinRoom(c, mainRoom)
 		_ = s.sendLine(c, "** connected. type /help | /?")
+
+		// load recent messages
+		msgs, err := s.repo.GetRecentMessagesWithUsers(mainRoom.ID)
+		if err != nil {
+			s.sendLine(c, "** error fetching recent messages: %v", err)
+		} else {
+			for _, msg := range msgs {
+				s.sendLine(c, "[%s] %s: %s", msg.SentAt.Format("15:04"), msg.Nick, msg.Body)
+			}
+		}
 
 		go s.writeLoop(c)
 		go s.readLoop(c)
@@ -257,8 +267,9 @@ func (s *Server) roomBroadcastLoop(r *Room) {
 		// fan-out to clients in this room
 		r.mu.RLock()
 		for c := range r.clients {
+			line := fmt.Sprintf("[%s] (%s) %s", msg.room.Name, msg.from.nick, strings.TrimSpace(string(msg.payload)))
 			select {
-			case c.out <- msg:
+			case c.out <- line:
 			default:
 				fmt.Printf("WARN: dropped message for slow client %s in room %s\n", c.nick, r.Name)
 				// drop for this client to avoid stalling the room
@@ -266,6 +277,7 @@ func (s *Server) roomBroadcastLoop(r *Room) {
 			}
 		}
 	}
+	r.mu.RUnlock()
 }
 
 func (s *Server) joinRoom(c *Client, r *Room) {
@@ -361,9 +373,8 @@ func (s *Server) readLoop(c *Client) {
 }
 
 func (s *Server) writeLoop(c *Client) {
-	for m := range c.out {
-		line := fmt.Sprintf("[%s] (%s) %s\n", m.room.Name, m.from.nick, string(m.payload))
-		if _, err := c.conn.Write([]byte(line)); err != nil {
+	for line := range c.out {
+		if _, err := c.conn.Write([]byte(line + "\n")); err != nil {
 			return
 		}
 	}
