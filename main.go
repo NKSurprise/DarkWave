@@ -144,7 +144,7 @@ func NewServer(addr string, repo *Repo) *Server {
 	return s
 }
 
-func (s *Server) Start() error {
+func (s *Server) Start(ctx context.Context) error {
 	ln, err := net.Listen("tcp", s.listenAddr)
 	if err != nil {
 		return err
@@ -161,9 +161,9 @@ func (s *Server) Start() error {
 	go s.dispatchLoop()
 
 	// accept clients
-	go s.acceptLoop()
+	go s.acceptLoop(ctx)
 
-	<-s.quitch
+	<-ctx.Done()
 	return nil
 }
 
@@ -177,12 +177,18 @@ func (s *Server) Stop() {
 	}
 }
 
-func (s *Server) acceptLoop() {
+func (s *Server) acceptLoop(ctx context.Context) {
 	for {
 		conn, err := s.ln.Accept()
 		if err != nil {
-			fmt.Println("accept:", err)
-			return
+			select {
+			case <-ctx.Done():
+				return // clean shutdown
+			default:
+				fmt.Println("accept:", err)
+				close(s.quitch) // unexpected error, signal shutdown
+				return
+			}
 		}
 
 		host, port, _ := net.SplitHostPort(conn.RemoteAddr().String())
@@ -227,24 +233,26 @@ func (s *Server) getOrCreateRoom(name string) *Room {
 func (s *Server) dispatchLoop() {
 	for m := range s.msgch {
 
-		go func(msg Message) {
-			if err := s.repo.SaveMessage(msg); err != nil {
-				fmt.Println("failed to save message:", err)
-			}
-		}(m)
+		// go func(msg Message) {       <--- - if we wanted to save asynchronously (not blocking the dispatch loop)
+		if err := s.repo.SaveMessage(m); err != nil {
+			fmt.Println("failed to save message:", err)
+		}
+		// }(m)
 
 		// forward to the room’s inbox (copy is already done in readLoop)
 		m.room.Inbox <- m
 
 		// server-side log
 		from := m.from.nick
-		fmt.Printf("[%s] (%s) %s", m.room.Name, from, string(m.payload))
 		fmt.Printf("DISPATCH -> %s\n", m.room.Name)
+		fmt.Printf("[%s] (%s) %s", m.room.Name, from, string(m.payload))
 	}
 }
 
 func (s *Server) roomBroadcastLoop(r *Room) {
+	r.mu.RLock()
 	fmt.Printf("BROADCAST %s to %d clients\n", r.Name, len(r.clients))
+	r.mu.RUnlock()
 	for msg := range r.Inbox {
 		// fan-out to clients in this room
 		r.mu.RLock()
@@ -252,11 +260,11 @@ func (s *Server) roomBroadcastLoop(r *Room) {
 			select {
 			case c.out <- msg:
 			default:
+				fmt.Printf("WARN: dropped message for slow client %s in room %s\n", c.nick, r.Name)
 				// drop for this client to avoid stalling the room
 				// (could count/log per client)
 			}
 		}
-		r.mu.RUnlock()
 	}
 }
 
@@ -308,6 +316,7 @@ func cleanInput(s string) string {
 
 func (s *Server) readLoop(c *Client) {
 	defer func() {
+		s.unregisterClientSingle(c)
 		if c.activeRoom != nil {
 			c.activeRoom.mu.Lock()
 			delete(c.activeRoom.clients, c)
@@ -374,11 +383,6 @@ func (s *Server) sendLine(c *Client, format string, args ...any) error {
 	}
 	fmt.Printf("sendLine wrote %d bytes: %q\n", n, fmt.Sprintf(format, args...))
 	return nil
-}
-
-func (s *Server) safeWrite(c *Client, msg []byte) error {
-	_, err := c.conn.Write(msg)
-	return err
 }
 
 func (s *Server) registerClientSingle(c *Client) {
@@ -532,7 +536,7 @@ func (r *Repo) getClientByID(ctx context.Context, id int64) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Client{UserID: id, nick: nick, password: ""}, nil
+	return &Client{UserID: id, nick: nick}, nil
 }
 
 func HashPassword(password string, p *Argon2Params) (encodedHash string, err error) {
@@ -995,7 +999,7 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 		_ = c.conn.Close()
 
 	default:
-		s.sendLine(c, "** unknown command: %s (type /help)", name)
+		s.sendLine(c, "** unknown command: %s (type /help | /?)", name)
 	}
 }
 
@@ -1035,5 +1039,5 @@ func main() {
 	repo := NewRepo(pool)
 
 	s := NewServer(":3000", repo)
-	log.Fatal(s.Start())
+	log.Fatal(s.Start(context.Background()))
 }
