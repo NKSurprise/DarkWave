@@ -42,12 +42,14 @@ func main() {
 	nick, _ := reader.ReadString('\n')
 	nick = strings.TrimSpace(nick)
 
+	// send login command to server
+	fmt.Fprintf(conn, "/nick %s\n", nick)
+
 	fmt.Print("password: ")
 	pass, _ := reader.ReadString('\n')
 	pass = strings.TrimSpace(pass)
 
-	// send login command to server
-	fmt.Fprintf(conn, "/nick %s %s\n", nick, pass)
+	fmt.Fprintf(conn, "%s\n", pass)
 
 	done := make(chan struct{})
 

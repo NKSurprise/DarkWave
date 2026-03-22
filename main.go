@@ -199,20 +199,6 @@ func (s *Server) acceptLoop(ctx context.Context) {
 			nick: "guest-" + port,
 		}
 
-		mainRoom := s.getOrCreateRoom("#main")
-		s.joinRoom(c, mainRoom)
-		_ = s.sendLine(c, "** connected. type /help | /?")
-
-		// load recent messages
-		msgs, err := s.repo.GetRecentMessagesWithUsers(mainRoom.ID)
-		if err != nil {
-			s.sendLine(c, "** error fetching recent messages: %v", err)
-		} else {
-			for _, msg := range msgs {
-				s.sendLine(c, "[%s] %s: %s", msg.SentAt.Format("15:04"), msg.Nick, msg.Body)
-			}
-		}
-
 		go s.writeLoop(c)
 		go s.readLoop(c)
 	}
@@ -665,15 +651,14 @@ func (s *Server) readLoopPassword(c *Client) (string, error) {
 	}
 
 	passwordPlainText := cleanInput(line)
-	if passwordPlainText == "" {
-		for i := 0; 5 <= len(passwordPlainText); i++ {
-			// Simulate password input processing
-
-			passwordPlainText, err = r.ReadString('\n')
-			if err != nil {
-				return "** error: %s", err
-			}
+	for i := 0; 5 > len(passwordPlainText); i++ {
+		// Simulate password input processing
+		s.sendLine(c, "** password should be at least 5 characters")
+		passwordPlainText, err = r.ReadString('\n')
+		if err != nil {
+			return "** error: %s", err
 		}
+
 	}
 
 	return passwordPlainText, nil
@@ -820,8 +805,6 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 		}
 
 		//input password
-		s.sendLine(c, "** enter password for %s:", retNick)
-		s.sendLine(c, "** password should be at least 5 characters")
 		passwordPlainText, err := s.readLoopPassword(c)
 		if err != nil {
 			s.sendLine(c, "** error reading password: %s", err)
@@ -835,10 +818,8 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 			return
 		}
 
-		var old string
 		//has a password already
 		if !userHasPassword {
-			old = user.nick
 			user.nick = retNick
 			user.UserID = id
 			c.nick = retNick
@@ -884,8 +865,21 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 
 		s.sendLine(c, "** welcome, %s!", retNick)
 		s.registerClientSingle(c)
-		s.sendLine(c, "** nick: %s -> %s (#%d)", old, retNick, id)
-		s.sendLine(c, "** id: %d", c.UserID)
+
+		mainRoom := s.getOrCreateRoom("#main")
+		s.joinRoom(c, mainRoom)
+		_ = s.sendLine(c, "** connected. type /help | /?")
+
+		// load recent messages
+		msgs, err := s.repo.GetRecentMessagesWithUsers(mainRoom.ID)
+		if err != nil {
+			s.sendLine(c, "** error fetching recent messages: %v", err)
+		} else {
+			for _, msg := range msgs {
+				s.sendLine(c, "[%s] %s: %s", msg.SentAt.Format("15:04"), msg.Nick, msg.Body)
+			}
+		}
+
 	case "/join":
 		if len(parts) < 2 {
 			s.sendLine(c, "usage: /join <room>")
