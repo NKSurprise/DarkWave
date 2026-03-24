@@ -46,7 +46,7 @@ var param = &Argon2Params{
 type Client struct {
 	UserID     int64
 	conn       net.Conn
-	out        chan Message
+	out        chan string
 	nick       string
 	password   string
 	activeRoom *Room
@@ -195,13 +195,9 @@ func (s *Server) acceptLoop(ctx context.Context) {
 		_ = host
 		c := &Client{
 			conn: conn,
-			out:  make(chan Message, 32),
+			out:  make(chan string, 32),
 			nick: "guest-" + port,
 		}
-
-		mainRoom := s.getOrCreateRoom("#main")
-		s.joinRoom(c, mainRoom)
-		_ = s.sendLine(c, "** connected. type /help | /?")
 
 		go s.writeLoop(c)
 		go s.readLoop(c)
@@ -254,16 +250,15 @@ func (s *Server) roomBroadcastLoop(r *Room) {
 	fmt.Printf("BROADCAST %s to %d clients\n", r.Name, len(r.clients))
 	r.mu.RUnlock()
 	for msg := range r.Inbox {
-		// fan-out to clients in this room
 		r.mu.RLock()
+		clients := make([]*Client, 0, len(r.clients))
 		for c := range r.clients {
-			select {
-			case c.out <- msg:
-			default:
-				fmt.Printf("WARN: dropped message for slow client %s in room %s\n", c.nick, r.Name)
-				// drop for this client to avoid stalling the room
-				// (could count/log per client)
-			}
+			clients = append(clients, c)
+		}
+		r.mu.RUnlock() // release lock before sending
+		for _, c := range clients {
+			line := fmt.Sprintf("[%s] (%s) %s", msg.room.Name, msg.from.nick, strings.TrimSpace(string(msg.payload)))
+			s.sendLine(c, "%s", line)
 		}
 	}
 }
@@ -361,9 +356,8 @@ func (s *Server) readLoop(c *Client) {
 }
 
 func (s *Server) writeLoop(c *Client) {
-	for m := range c.out {
-		line := fmt.Sprintf("[%s] (%s) %s\n", m.room.Name, m.from.nick, string(m.payload))
-		if _, err := c.conn.Write([]byte(line)); err != nil {
+	for line := range c.out {
+		if _, err := c.conn.Write([]byte(line + "\n")); err != nil {
 			return
 		}
 	}
@@ -654,15 +648,14 @@ func (s *Server) readLoopPassword(c *Client) (string, error) {
 	}
 
 	passwordPlainText := cleanInput(line)
-	if passwordPlainText == "" {
-		for i := 0; 5 <= len(passwordPlainText); i++ {
-			// Simulate password input processing
-
-			passwordPlainText, err = r.ReadString('\n')
-			if err != nil {
-				return "** error: %s", err
-			}
+	for i := 0; 5 > len(passwordPlainText); i++ {
+		// Simulate password input processing
+		s.sendLine(c, "** password should be at least 5 characters")
+		passwordPlainText, err = r.ReadString('\n')
+		if err != nil {
+			return "** error: %s", err
 		}
+
 	}
 
 	return passwordPlainText, nil
@@ -809,8 +802,6 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 		}
 
 		//input password
-		s.sendLine(c, "** enter password for %s:", retNick)
-		s.sendLine(c, "** password should be at least 5 characters")
 		passwordPlainText, err := s.readLoopPassword(c)
 		if err != nil {
 			s.sendLine(c, "** error reading password: %s", err)
@@ -824,10 +815,8 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 			return
 		}
 
-		var old string
 		//has a password already
 		if !userHasPassword {
-			old = user.nick
 			user.nick = retNick
 			user.UserID = id
 			c.nick = retNick
@@ -873,8 +862,21 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 
 		s.sendLine(c, "** welcome, %s!", retNick)
 		s.registerClientSingle(c)
-		s.sendLine(c, "** nick: %s -> %s (#%d)", old, retNick, id)
-		s.sendLine(c, "** id: %d", c.UserID)
+
+		mainRoom := s.getOrCreateRoom("#main")
+		s.joinRoom(c, mainRoom)
+		_ = s.sendLine(c, "** connected. type /help | /?")
+
+		// load recent messages
+		msgs, err := s.repo.GetRecentMessagesWithUsers(mainRoom.ID)
+		if err != nil {
+			s.sendLine(c, "** error fetching recent messages: %v", err)
+		} else {
+			for _, msg := range msgs {
+				s.sendLine(c, "[%s] %s: %s", msg.SentAt.Format("15:04"), msg.Nick, msg.Body)
+			}
+		}
+
 	case "/join":
 		if len(parts) < 2 {
 			s.sendLine(c, "usage: /join <room>")
@@ -890,7 +892,6 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 		room.ID = id
 		room.Name = retName
 		s.joinRoom(c, room)
-		s.sendLine(c, "** joined %s", room.Name)
 		// load recent messages
 		msgs, err := s.repo.GetRecentMessagesWithUsers(room.ID)
 		if err != nil {
