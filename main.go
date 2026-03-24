@@ -250,20 +250,17 @@ func (s *Server) roomBroadcastLoop(r *Room) {
 	fmt.Printf("BROADCAST %s to %d clients\n", r.Name, len(r.clients))
 	r.mu.RUnlock()
 	for msg := range r.Inbox {
-		// fan-out to clients in this room
 		r.mu.RLock()
+		clients := make([]*Client, 0, len(r.clients))
 		for c := range r.clients {
+			clients = append(clients, c)
+		}
+		r.mu.RUnlock() // release lock before sending
+		for _, c := range clients {
 			line := fmt.Sprintf("[%s] (%s) %s", msg.room.Name, msg.from.nick, strings.TrimSpace(string(msg.payload)))
-			select {
-			case c.out <- line:
-			default:
-				fmt.Printf("WARN: dropped message for slow client %s in room %s\n", c.nick, r.Name)
-				// drop for this client to avoid stalling the room
-				// (could count/log per client)
-			}
+			s.sendLine(c, "%s", line)
 		}
 	}
-	r.mu.RUnlock()
 }
 
 func (s *Server) joinRoom(c *Client, r *Room) {
@@ -895,7 +892,6 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 		room.ID = id
 		room.Name = retName
 		s.joinRoom(c, room)
-		s.sendLine(c, "** joined %s", room.Name)
 		// load recent messages
 		msgs, err := s.repo.GetRecentMessagesWithUsers(room.ID)
 		if err != nil {
