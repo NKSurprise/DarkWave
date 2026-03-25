@@ -96,8 +96,6 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 
 		//has a password already
 		if !userHasPassword {
-			user.nick = retNick
-			user.UserID = id
 			c.nick = retNick
 			c.UserID = id
 
