@@ -1,19 +1,23 @@
 # DarkWave 🌊
 
-A lightweight, encrypted TCP chat server and client written in Go. Connect to rooms, chat with others, and keep conversations private — only people with the right key can read what's being said.
+A lightweight, native desktop chat app built in Go. Real-time messaging, encrypted DMs, friend system, and room management — without the bloat of Electron.
 
-> Currently in active development. UI and audio channels coming in future releases.
+> Currently in active development. Audio channels coming in a future release.
 
 ---
 
 ## What it does
 
-- Real-time messaging over raw TCP
-- Multiple chat rooms — create or join any room with `/join`
-- Friend system — send, accept, and decline friend requests
+- Real-time messaging over TCP
+- Multiple chat rooms — join, leave, create
+- Friends system with real-time online/offline status
+- Encrypted direct messages (AES-GCM, end-to-end)
 - Password-protected accounts with Argon2 hashing
+- Room member tracking — see who's in a room live
 - Message persistence via PostgreSQL
-- Single-session enforcement — logging in from a new location kicks the old session
+- Native desktop UI built with Fyne (Windows, Mac, Linux)
+- Accent color theming — red, blue, green, or purple
+- Single-session enforcement — new login kicks the old session
 
 ---
 
@@ -24,14 +28,21 @@ DarkWave/
 ├── main.go        — entry point, wires everything together
 ├── server.go      — server lifecycle (start, stop, listen)
 ├── client.go      — client connection handling
-├── room.go        — room management and broadcasting
-├── commands.go    — command parsing and handling (/join, /nick, /friends, etc.)
+├── room.go        — room management, member tracking, broadcasting
+├── commands.go    — command parsing (/join, /nick, /dm, /leave, etc.)
 ├── dispatch.go    — message routing loop
-├── models.go      — structs (Client, Server, Room, Message)
+├── models.go      — structs (Client, Server, Room, Message, Friend)
 ├── db.go          — Repo struct and database connection
 ├── store.go       — all database query methods
 ├── crypto.go      — Argon2 password hashing and verification
-└── cmd/client/    — terminal client
+└── cmd/
+    ├── client/    — legacy terminal client
+    └── app/       — native desktop client (Fyne)
+        ├── main.go    — app entry, login screen, theme picker
+        ├── chat.go    — main chat UI (rooms, friends, DMs, members)
+        ├── net.go     — TCP connection and message handling
+        ├── crypto.go  — AES-GCM encryption for DMs
+        └── theme.go   — custom DarkWave theme
 ```
 
 ---
@@ -41,9 +52,12 @@ DarkWave/
 ### Prerequisites
 
 - Go 1.21+
-- PostgreSQL
+- PostgreSQL (or Supabase)
+- GCC (required by Fyne for CGO)
+  - **Windows**: install via [MSYS2](https://www.msys2.org/) — use the UCRT64 terminal
+  - **Linux/Mac**: install via your package manager
 
-### Setup
+### Server setup
 
 1. Create a PostgreSQL database:
    ```bash
@@ -61,13 +75,23 @@ DarkWave/
    go run .
    ```
 
-4. In a separate terminal, run the client:
-   ```bash
-   cd cmd/client
-   go run .
-   ```
+### Client setup (desktop UI)
 
-`APP_PORT` defaults to `:3000` if not set.
+**Windows (MSYS2 UCRT64 terminal):**
+```bash
+cd /d/git/DarkWave
+go run ./cmd/app/
+```
+
+**Linux/Mac:**
+```bash
+go run ./cmd/app/
+```
+
+### Terminal client (legacy)
+```bash
+go run ./cmd/client/
+```
 
 ---
 
@@ -75,9 +99,11 @@ DarkWave/
 
 | Command | Description |
 |---|---|
-| `/nick <name>` | Set your nickname and log in |
+| `/nick <n>` | Set your nickname and log in |
 | `/join <room>` | Join or create a room |
-| `/rooms` | List available rooms |
+| `/leave` | Leave the current room |
+| `/dm <nick>` | Open an encrypted DM with a friend |
+| `/rooms` | List your rooms |
 | `/friends` | List your friends |
 | `/addfriend <nick>` | Send a friend request |
 | `/friendreqs` | View pending friend requests |
@@ -88,27 +114,48 @@ DarkWave/
 
 ---
 
+## How DM encryption works
+
+Direct messages are encrypted client-side before being sent. The server only ever sees ciphertext and cannot read DM content.
+
+The shared key is derived from both usernames using SHA-256, sorted alphabetically so both sides always derive the same key independently. Messages are encrypted with AES-256-GCM, which provides both confidentiality and authenticity.
+
+```
+alice types "hey" 
+→ key = SHA256("alice:bob")
+→ encrypt with AES-GCM 
+→ send ciphertext to server
+→ server forwards ciphertext to bob
+→ bob derives same key
+→ decrypt → "hey"
+```
+
+---
+
 ## Roadmap
 
 - [x] TCP chat server
-- [x] Multiple rooms
+- [x] Multiple rooms with persistent membership
 - [x] Password-protected accounts (Argon2)
-- [x] Friend system
+- [x] Friend system with real-time online/offline status
 - [x] Message persistence
-- [x] Terminal client
-- [x] Refactored server and client architecture
-- [ ] Native desktop UI (Fyne)
+- [x] Room member tracking
+- [x] Native desktop UI (Fyne)
+- [x] Encrypted DMs (AES-GCM)
+- [x] Custom accent color theming
 - [ ] Audio channels (WebRTC via Pion)
-- [ ] End-to-end message encryption (AES)
+- [ ] End-to-end encryption for rooms
 
 ---
 
 ## Tech stack
 
 - **Go** — server and client
+- **Fyne** — native desktop UI
 - **PostgreSQL** — message and user persistence
 - **pgx** — PostgreSQL driver
 - **Argon2** — password hashing
+- **AES-GCM** — DM encryption
 - **godotenv** — environment variable loading
 
 ---
