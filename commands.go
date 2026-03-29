@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	argon2stuff "darkwave/passwordHandling"
 	"fmt"
@@ -32,7 +33,7 @@ func cleanInput(s string) string {
 	return s
 }
 
-func (s *Server) handleCommand(c *Client, cmd string) {
+func (s *Server) handleCommand(c *Client, cmd string, r *bufio.Reader) {
 	parts := strings.Fields(cmd)
 	if len(parts) == 0 {
 		return
@@ -47,7 +48,19 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 		if err := s.sendLine(c, helpText); err != nil {
 			fmt.Println("sendLine /help:", err)
 		}
-
+	// case "/rooms":
+	// 	names, err := s.repo.getUserRooms(context.Background(), c.UserID)
+	// 	if err != nil {
+	// 		s.sendLine(c, "** error: %v", err)
+	// 		return
+	// 	}
+	// 	var out string
+	// 	if len(names) == 0 {
+	// 		out = "** rooms: (none)"
+	// 	} else {
+	// 		out = "** rooms: " + strings.Join(names, ", ")
+	// 	}
+	// 	s.sendLine(c, "%s", out)
 	case "/rooms":
 		names, err := s.repo.listRooms()
 		if err != nil {
@@ -60,9 +73,7 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 		} else {
 			out = "** rooms: " + strings.Join(names, ", ")
 		}
-		if err := s.sendLine(c, "%s", out); err != nil {
-			fmt.Println("sendLine /rooms:", err)
-		}
+		s.sendLine(c, "%s", out)
 	case "/nick":
 		if len(parts) < 2 {
 			s.sendLine(c, "usage: /nick <name>")
@@ -81,7 +92,7 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 		}
 
 		//input password
-		passwordPlainText, err := s.readLoopPassword(c)
+		passwordPlainText, err := s.readLoopPassword(c, r)
 		if err != nil {
 			s.sendLine(c, "** error reading password: %s", err)
 			return
@@ -129,7 +140,7 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 					break
 				}
 				s.sendLine(c, "** please re-enter password for %s:", retNick)
-				passwordPlainText, err = s.readLoopPassword(c)
+				passwordPlainText, err = s.readLoopPassword(c, r)
 				if err != nil {
 					s.sendLine(c, "** error reading password: %s", err)
 					return
@@ -139,6 +150,7 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 
 		s.sendLine(c, "** welcome, %s!", retNick)
 		s.registerClientSingle(c)
+		s.notifyFriendsOnline(c)
 
 		mainRoom := s.getOrCreateRoom("#main")
 		s.joinRoom(c, mainRoom)
@@ -153,7 +165,6 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 				s.sendLine(c, "[%s] %s: %s", msg.SentAt.Format("15:04"), msg.Nick, msg.Body)
 			}
 		}
-
 	case "/join":
 		if len(parts) < 2 {
 			s.sendLine(c, "usage: /join <room>")
@@ -164,7 +175,11 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 			s.sendLine(c, "** error: %v", err)
 			return
 		}
-
+		// save membership to DB
+		if err := s.repo.addUserToRoom(context.Background(), c.UserID, id); err != nil {
+			s.sendLine(c, "** error joining room: %v", err)
+			return
+		}
 		room := s.getOrCreateRoom(retName)
 		room.ID = id
 		room.Name = retName
@@ -272,6 +287,74 @@ func (s *Server) handleCommand(c *Client, cmd string) {
 			return
 		}
 		s.sendLine(c, "** declined friend request from: %s", nick)
+	case "/leave":
+		if c.activeRoom == nil {
+			s.sendLine(c, "** you are not in a room")
+			return
+		}
+		roomID := c.activeRoom.ID
+		roomName := c.activeRoom.Name
+
+		// remove from DB
+		if err := s.repo.removeUserFromRoom(context.Background(), c.UserID, roomID); err != nil {
+			s.sendLine(c, "** error leaving room: %v", err)
+			return
+		}
+		// remove from in-memory room
+		c.activeRoom.mu.Lock()
+		delete(c.activeRoom.clients, c)
+		c.activeRoom.mu.Unlock()
+		c.activeRoom = nil
+
+		s.broadcastToRoom(s.rooms[roomName], fmt.Sprintf("** left: %s", c.nick))
+		s.sendLine(c, "** you left %s", roomName)
+	case "/online":
+		friends, err := s.repo.getFriendsByUserID(context.Background(), c.UserID)
+		if err != nil {
+			return
+		}
+		for _, f := range friends {
+			if friend, ok := s.onlineByUserID(f.friendID); ok {
+				s.sendLine(c, "** status: %s online", friend.nick)
+			}
+		}
+	case "/dm":
+		if len(parts) < 2 {
+			s.sendLine(c, "usage: /dm <nick>")
+			return
+		}
+		targetID, err := s.repo.findClientIDByNick(parts[1])
+		if err != nil {
+			s.sendLine(c, "** no user with nick: %s", parts[1])
+			return
+		}
+		// create deterministic room name so both users get same room
+		var roomName string
+		if c.UserID < targetID {
+			roomName = fmt.Sprintf("dm:%d-%d", c.UserID, targetID)
+		} else {
+			roomName = fmt.Sprintf("dm:%d-%d", targetID, c.UserID)
+		}
+		id, retName, err := s.repo.UpsertRoomByName(context.Background(), roomName)
+		if err != nil {
+			s.sendLine(c, "** error creating dm: %v", err)
+			return
+		}
+		room := s.getOrCreateRoom(retName)
+		room.ID = id
+		room.Name = retName
+		s.joinRoom(c, room)
+		// tell client who they're DMing and what the room is
+		s.sendLine(c, "** dm: %s %s", parts[1], retName)
+
+		msgs, err := s.repo.GetRecentMessagesWithUsers(room.ID)
+		if err != nil {
+			s.sendLine(c, "** error fetching recent messages: %v", err)
+		} else {
+			for _, msg := range msgs {
+				s.sendLine(c, "[%s] (%s) %s", msg.SentAt.Format("15:04"), msg.Nick, msg.Body)
+			}
+		}
 	case "/quit":
 		s.sendLine(c, "** bye")
 		_ = c.conn.Close()

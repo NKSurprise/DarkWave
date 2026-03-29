@@ -51,11 +51,30 @@ func (s *Server) joinRoom(c *Client, r *Room) {
 		old.mu.Lock()
 		delete(old.clients, c)
 		old.mu.Unlock()
+		s.broadcastToRoom(old, fmt.Sprintf("** left: %s", c.nick))
 	}
+
+	// broadcast join BEFORE adding c to room so c doesn't receive it
+	s.broadcastToRoom(r, fmt.Sprintf("** joined: %s", c.nick))
+
 	r.mu.Lock()
 	r.clients[c] = struct{}{}
 	r.mu.Unlock()
 	c.activeRoom = r
 
-	s.sendLine(c, "** joined %s", r.Name) // newline guaranteed
+	// send current members to joining client
+	nicks := r.memberNicks()
+	s.sendLine(c, "** members: %s", strings.Join(nicks, ", "))
+
+	s.sendLine(c, "** joined %s", r.Name)
+}
+
+func (r *Room) memberNicks() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var nicks []string
+	for c := range r.clients {
+		nicks = append(nicks, c.nick)
+	}
+	return nicks
 }

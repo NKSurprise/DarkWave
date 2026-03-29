@@ -38,6 +38,7 @@ func (s *Server) acceptLoop(ctx context.Context) {
 
 func (s *Server) readLoop(c *Client) {
 	defer func() {
+		s.notifyFriendsOffline(c)
 		s.unregisterClientSingle(c)
 		if c.activeRoom != nil {
 			c.activeRoom.mu.Lock()
@@ -63,7 +64,7 @@ func (s *Server) readLoop(c *Client) {
 
 		if strings.HasPrefix(text, "/") {
 			fmt.Println("DISPATCH CMD:", strconv.Quote(text)) // add: proves we hit command path
-			s.handleCommand(c, text)
+			s.handleCommand(c, text, r)
 			continue
 		}
 
@@ -133,24 +134,19 @@ func (s *Server) onlineByUserID(userID int64) (*Client, bool) {
 
 // create-or-get client by nick
 
-func (s *Server) readLoopPassword(c *Client) (string, error) {
-
-	r := bufio.NewReader(c.conn)
-	line, err := r.ReadString('\n')
+func (s *Server) readLoopPassword(c *Client, r *bufio.Reader) (string, error) {
+	line, err := r.ReadString('\n') // ← use passed r, not new one
 	if err != nil {
-		return "** error: %s", err
+		return "", err
 	}
-
 	passwordPlainText := cleanInput(line)
-	for i := 0; 5 > len(passwordPlainText); i++ {
-		// Simulate password input processing
+	for 5 > len(passwordPlainText) {
 		s.sendLine(c, "** password should be at least 5 characters")
-		passwordPlainText, err = r.ReadString('\n')
+		line, err = r.ReadString('\n')
 		if err != nil {
-			return "** error: %s", err
+			return "", err
 		}
-
+		passwordPlainText = cleanInput(line)
 	}
-
 	return passwordPlainText, nil
 }

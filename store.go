@@ -51,9 +51,9 @@ func (r *Repo) declineFriendRequest(ctx context.Context, fromID, toID int64) err
 
 func (r *Repo) addFriend(ctx context.Context, fromID, toID int64) error {
 	_, err := r.pool.Exec(ctx, `
-		insert into friends(user_id, friend_id, created_at)
-		values ($1, $2, now())
-	`, fromID, toID)
+        insert into friends(user_id, friend_id, created_at)
+        values ($1, $2, now()), ($2, $1, now())
+    `, fromID, toID)
 	return err
 }
 
@@ -69,19 +69,23 @@ func (r *Repo) acceptFriendRequest(ctx context.Context, fromID, toID int64) erro
 
 func (r *Repo) getFriendsByUserID(ctx context.Context, userID int64) ([]Friend, error) {
 	rows, err := r.pool.Query(ctx, `
-		select friend_id, created_at from friends where user_id = $1
-	`, userID)
+        select f.friend_id, f.user_id, f.created_at, c.nick
+        from friends f
+        join clients c on c.id = f.friend_id
+        where f.user_id = $1
+    `, userID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-
 	var friends []Friend
 	for rows.Next() {
 		var f Friend
-		if err := rows.Scan(&f.friendID, &f.createdAt); err != nil {
+		var nick string
+		if err := rows.Scan(&f.friendID, &f.userID, &f.createdAt, &nick); err != nil {
 			return nil, err
 		}
+		f.friend = &Client{nick: nick}
 		friends = append(friends, f)
 	}
 	return friends, nil
@@ -89,10 +93,11 @@ func (r *Repo) getFriendsByUserID(ctx context.Context, userID int64) ([]Friend, 
 
 func (r *Repo) getFriendRequestsByUserID(ctx context.Context, userID int64) ([]FriendRequest, error) {
 	rows, err := r.pool.Query(ctx, `
-		select id, from_id, to_id, status, created_at, responded_at
-		from friend_requests
-		where to_id = $1 and status = 'pending'
-	`, userID)
+        select fr.id, fr.from_id, fr.to_id, fr.status, fr.created_at, fr.responded_at, c.nick
+        from friend_requests fr
+        join clients c on c.id = fr.from_id
+        where fr.to_id = $1 and status = 'pending'
+    `, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -100,9 +105,11 @@ func (r *Repo) getFriendRequestsByUserID(ctx context.Context, userID int64) ([]F
 	var requests []FriendRequest
 	for rows.Next() {
 		var fr FriendRequest
-		if err := rows.Scan(&fr.ID, &fr.fromID, &fr.toID, &fr.status, &fr.createdAt, &fr.respondedAt); err != nil {
+		var nick string
+		if err := rows.Scan(&fr.ID, &fr.fromID, &fr.toID, &fr.status, &fr.createdAt, &fr.respondedAt, &nick); err != nil {
 			return nil, err
 		}
+		fr.fromNick = &Client{nick: nick}
 		requests = append(requests, fr)
 	}
 	return requests, nil
@@ -226,4 +233,58 @@ func (r *Repo) GetRecentMessagesWithUsers(roomID int64) ([]MessageWithSender, er
 		msgs = append(msgs, m)
 	}
 	return msgs, nil
+}
+
+func (r *Repo) addUserToRoom(ctx context.Context, userID, roomID int64) error {
+	_, err := r.pool.Exec(ctx, `
+        insert into room_members(user_id, room_id, joined_at)
+        values ($1, $2, now())
+        on conflict do nothing
+    `, userID, roomID)
+	return err
+}
+
+func (r *Repo) removeUserFromRoom(ctx context.Context, userID, roomID int64) error {
+	_, err := r.pool.Exec(ctx, `
+        delete from room_members where user_id = $1 and room_id = $2
+    `, userID, roomID)
+	return err
+}
+
+func (r *Repo) getUserRooms(ctx context.Context, userID int64) ([]string, error) {
+	rows, err := r.pool.Query(ctx, `
+        select ro.name from rooms ro
+        join room_members rm on rm.room_id = ro.id
+        where rm.user_id = $1
+    `, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		rows.Scan(&name)
+		names = append(names, name)
+	}
+	return names, nil
+}
+
+func (r *Repo) getRoomMembers(ctx context.Context, roomID int64) ([]string, error) {
+	rows, err := r.pool.Query(ctx, `
+        select c.nick from clients c
+        join room_members rm on rm.user_id = c.id
+        where rm.room_id = $1
+    `, roomID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var nicks []string
+	for rows.Next() {
+		var nick string
+		rows.Scan(&nick)
+		nicks = append(nicks, nick)
+	}
+	return nicks, nil
 }
