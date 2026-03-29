@@ -57,3 +57,40 @@ func (s *Server) Stop() {
 		_ = s.ln.Close()
 	}
 }
+
+func (s *Server) notifyFriendsOnline(c *Client) {
+	ctx := context.Background()
+	friends, err := s.repo.getFriendsByUserID(ctx, c.UserID)
+	if err != nil {
+		return
+	}
+	for _, f := range friends {
+		if friend, ok := s.onlineByUserID(f.friendID); ok {
+			// tell the friend that c is now online
+			s.sendLine(friend, "** status: %s online", c.nick)
+			// tell c which friends are already online
+			s.sendLine(c, "** status: %s online", friend.nick)
+		}
+	}
+}
+
+func (s *Server) notifyFriendsOffline(c *Client) {
+	ctx := context.Background()
+	friends, err := s.repo.getFriendsByUserID(ctx, c.UserID)
+	if err != nil {
+		return
+	}
+	for _, f := range friends {
+		if friend, ok := s.onlineByUserID(f.friendID); ok {
+			s.sendLine(friend, "** status: %s offline", c.nick)
+		}
+	}
+}
+
+func (s *Server) broadcastToRoom(r *Room, msg string) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for c := range r.clients {
+		s.sendLine(c, msg)
+	}
+}
