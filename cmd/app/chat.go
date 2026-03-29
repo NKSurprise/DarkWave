@@ -128,6 +128,7 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string) fyne.CanvasObjec
 		msgList.Refresh()
 		center.Objects = []fyne.CanvasObject{chatArea}
 		center.Refresh()
+		friendsHomeList.Unselect(i)
 	}
 
 	leaveBtn := widget.NewButton("🚪 Leave Room", func() {
@@ -137,7 +138,6 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string) fyne.CanvasObjec
 		membersList.Refresh()
 		msgList.Refresh()
 		// refresh rooms list
-		conn.send("/rooms")
 		center.Objects = []fyne.CanvasObject{friendsHome}
 		center.Refresh()
 	})
@@ -181,107 +181,113 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string) fyne.CanvasObjec
 	// -- INCOMING MESSAGES --
 	go func() {
 		for msg := range conn.incoming {
-			if strings.HasPrefix(msg, "** friends: ") {
-				raw := strings.TrimPrefix(msg, "** friends: ")
-				if raw == "(none)" {
-					friends = []FriendStatus{}
-				} else {
-					for _, nick := range strings.Split(raw, ", ") {
-						friends = append(friends, FriendStatus{nick: nick, online: false})
-					}
-				}
-				friendsHomeList.Refresh()
-				conn.send("/online")
-				continue
-			}
-			if strings.HasPrefix(msg, "** rooms: ") {
-				raw := strings.TrimPrefix(msg, "** rooms: ")
-				if raw != "(none)" {
-					allRooms := strings.Split(raw, ", ")
-					// filter out dm rooms
-					rooms = []string{}
-					for _, r := range allRooms {
-						if !strings.HasPrefix(r, "dm:") {
-							rooms = append(rooms, r)
-						}
-					}
-					roomsList.Refresh()
-				}
-				continue
-			}
-			if strings.HasPrefix(msg, "** status: ") {
-				parts := strings.Fields(strings.TrimPrefix(msg, "** status: "))
-				if len(parts) == 2 {
-					nick, status := parts[0], parts[1]
-					for i, f := range friends {
-						if f.nick == nick {
-							friends[i].online = status == "online"
-							break
+			msg := msg // capture
+			fyne.Do(func() {
+				if strings.HasPrefix(msg, "** friends: ") {
+					raw := strings.TrimPrefix(msg, "** friends: ")
+					if raw == "(none)" {
+						friends = []FriendStatus{}
+					} else {
+						for _, nick := range strings.Split(raw, ", ") {
+							friends = append(friends, FriendStatus{nick: nick, online: false})
 						}
 					}
 					friendsHomeList.Refresh()
+					conn.send("/online")
+					return
 				}
-				continue
-			}
-			if strings.HasPrefix(msg, "** members: ") {
-				raw := strings.TrimPrefix(msg, "** members: ")
-				members = strings.Split(raw, ", ")
-				membersList.Refresh()
-				continue
-			}
-			if strings.HasPrefix(msg, "** joined: ") {
-				nick := strings.TrimPrefix(msg, "** joined: ")
-				members = append(members, nick)
-				membersList.Refresh()
-				continue
-			}
-			if strings.HasPrefix(msg, "** connected.") ||
-				strings.HasPrefix(msg, "** welcome,") ||
-				strings.HasPrefix(msg, "** joined ") ||
-				strings.HasPrefix(msg, "** left ") {
-				continue
-			}
-			if strings.HasPrefix(msg, "** left ") {
-				continue
-			}
-			if strings.HasPrefix(msg, "** left: ") {
-				nick := strings.TrimPrefix(msg, "** left: ")
-				for i, m := range members {
-					if m == nick {
-						members = append(members[:i], members[i+1:]...)
-						break
+				if strings.HasPrefix(msg, "** rooms: ") {
+					raw := strings.TrimPrefix(msg, "** rooms: ")
+					if raw != "(none)" {
+						allRooms := strings.Split(raw, ", ")
+						rooms = []string{}
+						for _, r := range allRooms {
+							if !strings.HasPrefix(r, "dm:") {
+								rooms = append(rooms, r)
+							}
+						}
+						roomsList.Refresh()
+					}
+					return
+				}
+				if strings.HasPrefix(msg, "** status: ") {
+					parts := strings.Fields(strings.TrimPrefix(msg, "** status: "))
+					if len(parts) == 2 {
+						nick, status := parts[0], parts[1]
+						for i, f := range friends {
+							if f.nick == nick {
+								friends[i].online = status == "online"
+								break
+							}
+						}
+						friendsHomeList.Refresh()
+					}
+					return
+				}
+				if strings.HasPrefix(msg, "** members: ") {
+					raw := strings.TrimPrefix(msg, "** members: ")
+					members = strings.Split(raw, ", ")
+					membersList.Refresh()
+					return
+				}
+				if strings.HasPrefix(msg, "** joined: ") {
+					nick := strings.TrimPrefix(msg, "** joined: ")
+					members = append(members, nick)
+					membersList.Refresh()
+					return
+				}
+				if strings.HasPrefix(msg, "** joined ") {
+					return
+				}
+				if strings.HasPrefix(msg, "** left: ") {
+					nick := strings.TrimPrefix(msg, "** left: ")
+					for i, m := range members {
+						if m == nick {
+							members = append(members[:i], members[i+1:]...)
+							break
+						}
+					}
+					membersList.Refresh()
+					return
+				}
+				if strings.HasPrefix(msg, "** left ") {
+					return
+				}
+				if strings.HasPrefix(msg, "** you left") {
+					conn.send("/rooms")
+					leaveBtn.Hide()
+					msgs = []string{}
+					msgList.Refresh()
+					center.Objects = []fyne.CanvasObject{friendsHome}
+					center.Refresh()
+					return
+				}
+				if strings.HasPrefix(msg, "** dm: ") {
+					parts := strings.Fields(strings.TrimPrefix(msg, "** dm: "))
+					if len(parts) == 2 {
+						isDM = true
+						currentDMKey = deriveKey(myNick, parts[0])
+					}
+					return
+				}
+				if strings.HasPrefix(msg, "** connected.") ||
+					strings.HasPrefix(msg, "** welcome,") {
+					return
+				}
+				if isDM && currentDMKey != nil {
+					if idx := strings.Index(msg, ") "); idx != -1 {
+						prefix := msg[:idx+2]
+						ciphertext := msg[idx+2:]
+						decrypted, err := decryptMsg(ciphertext, currentDMKey)
+						if err == nil {
+							msg = prefix + decrypted
+						}
 					}
 				}
-				membersList.Refresh()
-				continue
-			}
-			if strings.HasPrefix(msg, "** you left") {
-				conn.send("/rooms")
-				leaveBtn.Hide()
-				continue
-			}
-			if strings.HasPrefix(msg, "** dm: ") {
-				parts := strings.Fields(strings.TrimPrefix(msg, "** dm: "))
-				if len(parts) == 2 {
-					isDM = true
-					currentDMKey = deriveKey(myNick, parts[0])
-				}
-				continue
-			}
-			if isDM && currentDMKey != nil {
-				// format is "[dm:1-5] (nick) ciphertext"
-				if idx := strings.Index(msg, ") "); idx != -1 {
-					prefix := msg[:idx+2]
-					ciphertext := msg[idx+2:]
-					decrypted, err := decryptMsg(ciphertext, currentDMKey)
-					if err == nil {
-						msg = prefix + decrypted
-					}
-				}
-			}
-			msgs = append(msgs, msg)
-			msgList.Refresh()
-			msgList.ScrollToBottom()
+				msgs = append(msgs, msg)
+				msgList.Refresh()
+				msgList.ScrollToBottom()
+			})
 		}
 	}()
 

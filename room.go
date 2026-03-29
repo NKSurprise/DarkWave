@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 func (s *Server) getOrCreateRoom(name string) *Room {
@@ -39,7 +40,18 @@ func (s *Server) roomBroadcastLoop(r *Room) {
 		}
 		r.mu.RUnlock() // release lock before sending
 		for _, c := range clients {
-			line := fmt.Sprintf("[%s] (%s) %s", msg.room.Name, msg.from.nick, strings.TrimSpace(string(msg.payload)))
+			var line string
+			if strings.HasPrefix(msg.room.Name, "dm:") {
+				line = fmt.Sprintf("[%s] (%s) %s",
+					time.Now().Format("15:04"),
+					msg.from.nick,
+					strings.TrimSpace(string(msg.payload)))
+			} else {
+				line = fmt.Sprintf("[%s] (%s) %s",
+					msg.room.Name,
+					msg.from.nick,
+					strings.TrimSpace(string(msg.payload)))
+			}
 			s.sendLine(c, "%s", line)
 		}
 	}

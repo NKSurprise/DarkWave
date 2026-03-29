@@ -88,9 +88,12 @@ func (s *Server) notifyFriendsOffline(c *Client) {
 }
 
 func (s *Server) broadcastToRoom(r *Room, msg string) {
+	if r == nil {
+		return
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	for c := range r.clients {
-		s.sendLine(c, msg)
+		s.sendLine(c, "%s", msg)
 	}
 }

@@ -48,21 +48,8 @@ func (s *Server) handleCommand(c *Client, cmd string, r *bufio.Reader) {
 		if err := s.sendLine(c, helpText); err != nil {
 			fmt.Println("sendLine /help:", err)
 		}
-	// case "/rooms":
-	// 	names, err := s.repo.getUserRooms(context.Background(), c.UserID)
-	// 	if err != nil {
-	// 		s.sendLine(c, "** error: %v", err)
-	// 		return
-	// 	}
-	// 	var out string
-	// 	if len(names) == 0 {
-	// 		out = "** rooms: (none)"
-	// 	} else {
-	// 		out = "** rooms: " + strings.Join(names, ", ")
-	// 	}
-	// 	s.sendLine(c, "%s", out)
 	case "/rooms":
-		names, err := s.repo.listRooms()
+		names, err := s.repo.getUserRooms(context.Background(), c.UserID)
 		if err != nil {
 			s.sendLine(c, "** error: %v", err)
 			return
@@ -292,21 +279,20 @@ func (s *Server) handleCommand(c *Client, cmd string, r *bufio.Reader) {
 			s.sendLine(c, "** you are not in a room")
 			return
 		}
-		roomID := c.activeRoom.ID
-		roomName := c.activeRoom.Name
+		room := c.activeRoom // save reference before clearing
+		roomID := room.ID
+		roomName := room.Name
 
-		// remove from DB
 		if err := s.repo.removeUserFromRoom(context.Background(), c.UserID, roomID); err != nil {
 			s.sendLine(c, "** error leaving room: %v", err)
 			return
 		}
-		// remove from in-memory room
-		c.activeRoom.mu.Lock()
-		delete(c.activeRoom.clients, c)
-		c.activeRoom.mu.Unlock()
+		room.mu.Lock()
+		delete(room.clients, c)
+		room.mu.Unlock()
 		c.activeRoom = nil
 
-		s.broadcastToRoom(s.rooms[roomName], fmt.Sprintf("** left: %s", c.nick))
+		s.broadcastToRoom(room, fmt.Sprintf("** left: %s", c.nick))
 		s.sendLine(c, "** you left %s", roomName)
 	case "/online":
 		friends, err := s.repo.getFriendsByUserID(context.Background(), c.UserID)
