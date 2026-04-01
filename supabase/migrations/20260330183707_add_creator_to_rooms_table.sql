@@ -1,0 +1,1 @@
+alter table rooms add column creator_id bigint references clients(id);

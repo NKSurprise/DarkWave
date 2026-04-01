@@ -31,12 +31,12 @@ func (r *Repo) UpsertClientByNick(ctx context.Context, nick string) (id int64, r
 }
 
 // create-or-get room by name
-func (r *Repo) UpsertRoomByName(ctx context.Context, name string) (id int64, retName string, err error) {
+func (r *Repo) UpsertRoomByName(ctx context.Context, name string, creatorID int64) (id int64, retName string, err error) {
 	err = r.pool.QueryRow(ctx, `
-        insert into rooms(name) values ($1)
+        insert into rooms(name, creator_id) values ($1, $2)
         on conflict(name) do update set name = excluded.name
         returning id, name
-    `, name).Scan(&id, &retName)
+    `, name, creatorID).Scan(&id, &retName)
 	return id, retName, err
 }
 
@@ -287,4 +287,42 @@ func (r *Repo) getRoomMembers(ctx context.Context, roomID int64) ([]string, erro
 		nicks = append(nicks, nick)
 	}
 	return nicks, nil
+}
+
+func (r *Repo) createVoiceChannel(ctx context.Context, roomID int64, name string) (int64, error) {
+	var id int64
+	err := r.pool.QueryRow(ctx, `
+        insert into voice_channels(room_id, name)
+        values ($1, $2)
+        returning id
+    `, roomID, name).Scan(&id)
+	return id, err
+}
+
+func (r *Repo) getVoiceChannels(ctx context.Context, roomID int64) ([]string, error) {
+	rows, err := r.pool.Query(ctx, `
+        select name from voice_channels where room_id = $1 order by created_at
+    `, roomID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var name string
+		rows.Scan(&name)
+		names = append(names, name)
+	}
+	return names, nil
+}
+
+func (r *Repo) isRoomCreator(ctx context.Context, userID, roomID int64) (bool, error) {
+	var creatorID int64
+	err := r.pool.QueryRow(ctx, `
+        select creator_id from rooms where id = $1
+    `, roomID).Scan(&creatorID)
+	if err != nil {
+		return false, err
+	}
+	return creatorID == userID, nil
 }

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"os"
 
@@ -28,9 +29,19 @@ func main() {
 	if port == "" {
 		port = ":3000"
 	}
+	wsPort := os.Getenv("WS_PORT")
+	if wsPort == "" {
+		wsPort = ":3001"
+	}
 
 	pool := mustInitPool(dbURL)
 	defer pool.Close()
+
+	fmt.Println("DB connected ✅  listening on", port)
+
+	// start signal server
+	ss := NewSignalServer()
+	ss.Start(wsPort)
 
 	repo := NewRepo(pool)
 	s := NewServer(port, repo)
