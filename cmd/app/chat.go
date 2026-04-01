@@ -1,11 +1,13 @@
 package main
 
 import (
+	"fmt"
 	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/widget"
+	"github.com/gordonklaus/portaudio"
 )
 
 type FriendStatus struct {
@@ -13,13 +15,28 @@ type FriendStatus struct {
 	online bool
 }
 
+type RoomWithVoice struct {
+	name          string
+	voiceChannels []string
+}
+
+type VoiceMember struct {
+	nick     string
+	speaking bool
+}
+
 func chatScreen(w fyne.Window, conn *Connection, myNick string) fyne.CanvasObject {
 	var msgs []string
 	var friends []FriendStatus
-	var rooms []string
+	var currentRoom string
 	var currentDMKey []byte
 	var isDM bool
 	var members []string
+	var roomsWithVoice []RoomWithVoice
+	var voiceClient *VoiceClient
+	var voiceMembers []VoiceMember
+	var savedInputDevice *portaudio.DeviceInfo
+	var savedOutputDevice *portaudio.DeviceInfo
 
 	// -- FRIENDS HOME LIST --
 	friendsHomeList := widget.NewList(
@@ -87,15 +104,6 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string) fyne.CanvasObjec
 
 	// -- ON FRIEND CLICK --
 
-	// -- ROOMS SIDEBAR --
-	roomsList := widget.NewList(
-		func() int { return len(rooms) },
-		func() fyne.CanvasObject { return widget.NewLabel("") },
-		func(i widget.ListItemID, o fyne.CanvasObject) {
-			o.(*widget.Label).SetText("# " + rooms[i])
-		},
-	)
-
 	// -- MEMBERS PANEL --
 	membersList := widget.NewList(
 		func() int { return len(members) },
@@ -131,6 +139,38 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string) fyne.CanvasObjec
 		friendsHomeList.Unselect(i)
 	}
 
+	voiceMembersList := widget.NewList(
+		func() int { return len(voiceMembers) },
+		func() fyne.CanvasObject {
+			indicator := widget.NewLabel("○")
+			name := widget.NewLabel("")
+			return container.NewHBox(indicator, name)
+		},
+		func(i widget.ListItemID, o fyne.CanvasObject) {
+			row := o.(*fyne.Container)
+			indicator := row.Objects[0].(*widget.Label)
+			name := row.Objects[1].(*widget.Label)
+			name.SetText(voiceMembers[i].nick)
+			if voiceMembers[i].speaking {
+				indicator.SetText("●")
+			} else {
+				indicator.SetText("○")
+			}
+		},
+	)
+
+	var leaveVoiceBtn *widget.Button
+	leaveVoiceBtn = widget.NewButton("🔇 Leave Voice", func() {
+		if voiceClient != nil {
+			voiceClient.LeaveChannel()
+			voiceClient = nil
+		}
+		voiceMembers = []VoiceMember{}
+		voiceMembersList.Refresh()
+		leaveVoiceBtn.Hide()
+	})
+	leaveVoiceBtn.Hide()
+
 	leaveBtn := widget.NewButton("🚪 Leave Room", func() {
 		conn.send("/leave")
 		msgs = []string{}
@@ -144,6 +184,137 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string) fyne.CanvasObjec
 	leaveBtn.Importance = widget.DangerImportance
 	leaveBtn.Hide()
 
+	roomsList := widget.NewList(
+		func() int {
+			total := 0
+			for _, r := range roomsWithVoice {
+				total++                       // room name
+				total += len(r.voiceChannels) // voice channels
+			}
+			return total
+		},
+		func() fyne.CanvasObject {
+			return widget.NewLabel("")
+		},
+		func(i widget.ListItemID, o fyne.CanvasObject) {
+			label := o.(*widget.Label)
+			// find which item index i corresponds to
+			idx := 0
+			for _, r := range roomsWithVoice {
+				if idx == i {
+					label.SetText("# " + r.name)
+					label.TextStyle = fyne.TextStyle{Bold: true}
+					return
+				}
+				idx++
+				for _, vc := range r.voiceChannels {
+					if idx == i {
+						label.SetText("  🔊 " + vc)
+						label.TextStyle = fyne.TextStyle{}
+						return
+					}
+					idx++
+				}
+			}
+		},
+	)
+
+	voicePanel := container.NewBorder(
+		widget.NewLabelWithStyle("Voice", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
+		nil, nil, nil,
+		voiceMembersList,
+	)
+
+	rightPanel := container.NewVSplit(membersPanel, voicePanel)
+	rightPanel.SetOffset(0.6)
+	chatWithMembers = container.NewHSplit(chatArea, rightPanel)
+
+	roomsList.OnSelected = func(i widget.ListItemID) {
+		// figure out what was clicked
+		idx := 0
+		for _, r := range roomsWithVoice {
+			if idx == i {
+				currentRoom = r.name
+				isDM = false
+				currentDMKey = nil
+				members = []string{}
+				membersList.Refresh()
+				conn.send("/join " + r.name)
+				conn.send("/voicechannels")
+				msgs = []string{}
+				msgList.Refresh()
+				center.Objects = []fyne.CanvasObject{chatWithMembers}
+				center.Refresh()
+				chatWithMembers.SetOffset(0.75)
+				leaveBtn.Show()
+				currentRoom = r.name
+				conn.send("/voicechannels")
+				return
+			}
+			idx++
+			for _, vc := range r.voiceChannels {
+				if idx == i {
+					go func(channelName string) {
+						//var inputDev, outputDev *portaudio.DeviceInfo
+						if voiceClient != nil {
+							savedInputDevice = voiceClient.inputDevice
+							savedOutputDevice = voiceClient.outputDevice
+							voiceClient.LeaveChannel()
+							voiceClient = nil
+						}
+						voiceClient = NewVoiceClient(myNick)
+						voiceClient.inputDevice = savedInputDevice
+						voiceClient.outputDevice = savedOutputDevice
+
+						// set ALL callbacks before joining
+						voiceClient.onSpeaking = func(nick string, speaking bool) {
+							fyne.Do(func() {
+								for i, m := range voiceMembers {
+									if m.nick == nick {
+										voiceMembers[i].speaking = speaking
+										voiceMembersList.Refresh()
+										return
+									}
+								}
+							})
+						}
+						voiceClient.onMemberJoin = func(nick string) {
+							fyne.Do(func() {
+								voiceMembers = append(voiceMembers, VoiceMember{nick: nick})
+								voiceMembersList.Refresh()
+							})
+						}
+						voiceClient.onMemberLeave = func(nick string) {
+							fyne.Do(func() {
+								for i, m := range voiceMembers {
+									if m.nick == nick {
+										voiceMembers = append(voiceMembers[:i], voiceMembers[i+1:]...)
+										break
+									}
+								}
+								voiceMembersList.Refresh()
+							})
+						}
+
+						wsAddr := "ws://localhost:3001"
+						roomName := strings.TrimPrefix(r.name, "#")
+						err := voiceClient.JoinChannel(wsAddr, roomName+"/"+channelName)
+						if err != nil {
+							fmt.Println("voice join error:", err)
+							return
+						}
+						fyne.Do(func() {
+							leaveVoiceBtn.Show()
+							voiceMembers = []VoiceMember{{nick: myNick}}
+							voiceMembersList.Refresh()
+						})
+					}(vc)
+					return
+				}
+				idx++
+			}
+		}
+	}
 	friendsBtn := widget.NewButton("👥 Friends", func() {
 		isDM = false
 		currentDMKey = nil
@@ -155,7 +326,18 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string) fyne.CanvasObjec
 		center.Refresh()
 	})
 
-	bottomBtns := container.NewVBox(leaveBtn, friendsBtn)
+	settingsBtn := widget.NewButton("⚙ Audio", func() {
+		showAudioSettings(w, voiceClient, func(input, output *portaudio.DeviceInfo) {
+			savedInputDevice = input
+			savedOutputDevice = output
+			if voiceClient != nil {
+				voiceClient.inputDevice = input
+				voiceClient.outputDevice = output
+			}
+		})
+	})
+
+	bottomBtns := container.NewVBox(leaveVoiceBtn, leaveBtn, settingsBtn, friendsBtn)
 
 	roomsPanel := container.NewBorder(
 		widget.NewLabelWithStyle("Rooms", fyne.TextAlignLeading, fyne.TextStyle{Bold: true}),
@@ -163,20 +345,6 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string) fyne.CanvasObjec
 		nil, nil,
 		roomsList,
 	)
-
-	roomsList.OnSelected = func(i widget.ListItemID) {
-		isDM = false
-		currentDMKey = nil
-		members = []string{}
-		membersList.Refresh()
-		conn.send("/join " + rooms[i])
-		msgs = []string{}
-		msgList.Refresh()
-		center.Objects = []fyne.CanvasObject{chatWithMembers} // ← chatWithMembers not chatArea
-		center.Refresh()
-		chatWithMembers.SetOffset(0.75)
-		leaveBtn.Show()
-	}
 
 	// -- INCOMING MESSAGES --
 	go func() {
@@ -200,14 +368,38 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string) fyne.CanvasObjec
 					raw := strings.TrimPrefix(msg, "** rooms: ")
 					if raw != "(none)" {
 						allRooms := strings.Split(raw, ", ")
-						rooms = []string{}
+						roomsWithVoice = []RoomWithVoice{}
 						for _, r := range allRooms {
 							if !strings.HasPrefix(r, "dm:") {
-								rooms = append(rooms, r)
+								roomsWithVoice = append(roomsWithVoice, RoomWithVoice{name: r})
 							}
 						}
 						roomsList.Refresh()
 					}
+					return
+				}
+				if strings.HasPrefix(msg, "** voice channels: ") {
+					raw := strings.TrimPrefix(msg, "** voice channels: ")
+					if raw != "(none)" {
+						for i, r := range roomsWithVoice {
+							if r.name == currentRoom {
+								roomsWithVoice[i].voiceChannels = strings.Split(raw, ", ")
+								break
+							}
+						}
+					}
+					roomsList.Refresh()
+					return
+				}
+				if strings.HasPrefix(msg, "** voicechannel added: ") {
+					name := strings.TrimPrefix(msg, "** voicechannel added: ")
+					for i, r := range roomsWithVoice {
+						if r.name == currentRoom {
+							roomsWithVoice[i].voiceChannels = append(roomsWithVoice[i].voiceChannels, name)
+							break
+						}
+					}
+					roomsList.Refresh()
 					return
 				}
 				if strings.HasPrefix(msg, "** status: ") {

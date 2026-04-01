@@ -61,6 +61,42 @@ func (s *Server) handleCommand(c *Client, cmd string, r *bufio.Reader) {
 			out = "** rooms: " + strings.Join(names, ", ")
 		}
 		s.sendLine(c, "%s", out)
+	case "/createvoice":
+		if len(parts) < 2 {
+			s.sendLine(c, "usage: /createvoice <name>")
+			return
+		}
+		if c.activeRoom == nil {
+			s.sendLine(c, "** join a room first")
+			return
+		}
+		isCreator, err := s.repo.isRoomCreator(context.Background(), c.UserID, c.activeRoom.ID)
+		if err != nil || !isCreator {
+			s.sendLine(c, "** only the room creator can create voice channels")
+			return
+		}
+		_, err = s.repo.createVoiceChannel(context.Background(), c.activeRoom.ID, parts[1])
+		if err != nil {
+			s.sendLine(c, "** error creating voice channel: %v", err)
+			return
+		}
+		s.broadcastToRoom(c.activeRoom, fmt.Sprintf("** voicechannel added: %s", parts[1]))
+		s.sendLine(c, "** voice channel %s created", parts[1])
+	case "/voicechannels":
+		if c.activeRoom == nil {
+			s.sendLine(c, "** join a room first")
+			return
+		}
+		names, err := s.repo.getVoiceChannels(context.Background(), c.activeRoom.ID)
+		if err != nil {
+			s.sendLine(c, "** error fetching voice channels: %v", err)
+			return
+		}
+		if len(names) == 0 {
+			s.sendLine(c, "** voice channels: (none)")
+			return
+		}
+		s.sendLine(c, "** voice channels: %s", strings.Join(names, ", "))
 	case "/nick":
 		if len(parts) < 2 {
 			s.sendLine(c, "usage: /nick <name>")
@@ -157,7 +193,7 @@ func (s *Server) handleCommand(c *Client, cmd string, r *bufio.Reader) {
 			s.sendLine(c, "usage: /join <room>")
 			return
 		}
-		id, retName, err := s.repo.UpsertRoomByName(context.Background(), parts[1])
+		id, retName, err := s.repo.UpsertRoomByName(context.Background(), parts[1], c.UserID)
 		if err != nil {
 			s.sendLine(c, "** error: %v", err)
 			return
@@ -321,7 +357,7 @@ func (s *Server) handleCommand(c *Client, cmd string, r *bufio.Reader) {
 		} else {
 			roomName = fmt.Sprintf("dm:%d-%d", targetID, c.UserID)
 		}
-		id, retName, err := s.repo.UpsertRoomByName(context.Background(), roomName)
+		id, retName, err := s.repo.UpsertRoomByName(context.Background(), roomName, c.UserID)
 		if err != nil {
 			s.sendLine(c, "** error creating dm: %v", err)
 			return
