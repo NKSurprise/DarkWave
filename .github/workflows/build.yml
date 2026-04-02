@@ -53,6 +53,12 @@ jobs:
           name: DarkWave-windows
           path: DarkWave-windows.zip
 
+      - name: Upload to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: DarkWave-windows.zip
+
   build-linux:
     runs-on: ubuntu-latest
     steps:
@@ -83,6 +89,12 @@ jobs:
           name: DarkWave-linux
           path: DarkWave-linux
 
+      - name: Upload to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: DarkWave-linux
+
   build-mac:
     runs-on: macos-latest
     steps:
@@ -111,3 +123,9 @@ jobs:
         with:
           name: DarkWave-mac
           path: DarkWave-mac
+
+      - name: Upload to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: DarkWave-mac
