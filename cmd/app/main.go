@@ -3,6 +3,7 @@ package main
 import (
 	_ "embed"
 	"image/color"
+	"os"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -16,6 +17,10 @@ var iconBytes []byte
 var currentApp fyne.App
 
 func main() {
+	// force software OpenGL renderer - fixes GPU driver issues on some machines
+	os.Setenv("LIBGL_ALWAYS_SOFTWARE", "1")
+	os.Setenv("MESA_GL_VERSION_OVERRIDE", "3.3COMPAT")
+
 	currentApp = app.New()
 	currentApp.SetIcon(fyne.NewStaticResource("Icon.png", iconBytes))
 	currentApp.Settings().SetTheme(NewDarkWaveTheme(AccentBlue))
