@@ -31,13 +31,23 @@ jobs:
         run: |
           export GOROOT=/ucrt64/lib/go
           export PATH="/ucrt64/lib/go/bin:$PATH"
-          go build -o DarkWave-windows.exe ./cmd/app/
+          go build -o DarkWave.exe ./cmd/app/
+          mkdir DarkWave-windows
+          mv DarkWave.exe DarkWave-windows/
+          cp /ucrt64/bin/libportaudio.dll DarkWave-windows/
+          cp /ucrt64/bin/libopus-0.dll DarkWave-windows/
+          cp /ucrt64/bin/libopusfile-0.dll DarkWave-windows/
+          cp /ucrt64/bin/librnnoise-0.dll DarkWave-windows/
+          cp /ucrt64/bin/libgcc_s_seh-1.dll DarkWave-windows/ || true
+          cp /ucrt64/bin/libstdc++-6.dll DarkWave-windows/ || true
+          cp /ucrt64/bin/libwinpthread-1.dll DarkWave-windows/ || true
+          zip -r DarkWave-windows.zip DarkWave-windows/
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
           name: DarkWave-windows
-          path: DarkWave-windows.exe
+          path: DarkWave-windows.zip
 
   build-linux:
     runs-on: ubuntu-latest
@@ -52,23 +62,12 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
-            gcc \
-            libportaudio2 \
-            portaudio19-dev \
-            libopus-dev \
-            libopusfile-dev \
-            pkg-config \
-            libgl1-mesa-dev \
-            xorg-dev \
-            cmake
+          sudo apt-get install -y gcc libportaudio2 portaudio19-dev libopus-dev libopusfile-dev pkg-config libgl1-mesa-dev xorg-dev cmake autoconf automake libtool
+
+      - name: Build rnnoise
+        run: |
           git clone https://github.com/xiph/rnnoise.git
-          cd rnnoise
-          mkdir build && cd build
-          cmake ..
-          make
-          sudo make install
-          sudo ldconfig
+          cd rnnoise && ./autogen.sh && ./configure && make && sudo make install && sudo ldconfig
 
       - name: Build Linux
         run: |
@@ -92,15 +91,12 @@ jobs:
 
       - name: Install dependencies
         run: |
-          brew install portaudio opus opusfile pkg-config cmake
-          if ! pkg-config --exists rnnoise; then
-            git clone https://github.com/xiph/rnnoise.git
-            cd rnnoise
-            mkdir build && cd build
-            cmake ..
-            make
-            sudo make install
-          fi
+          brew install portaudio opus opusfile pkg-config cmake autoconf automake libtool
+
+      - name: Build rnnoise
+        run: |
+          git clone https://github.com/xiph/rnnoise.git
+          cd rnnoise && ./autogen.sh && ./configure && make && sudo make install
 
       - name: Build Mac
         run: |
