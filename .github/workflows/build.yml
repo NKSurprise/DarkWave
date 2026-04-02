@@ -41,7 +41,11 @@ jobs:
           cp /ucrt64/bin/libgcc_s_seh-1.dll DarkWave-windows/ || true
           cp /ucrt64/bin/libstdc++-6.dll DarkWave-windows/ || true
           cp /ucrt64/bin/libwinpthread-1.dll DarkWave-windows/ || true
-          zip -r DarkWave-windows.zip DarkWave-windows/
+
+      - name: Zip Windows build
+        shell: pwsh
+        run: |
+          Compress-Archive -Path DarkWave-windows -DestinationPath DarkWave-windows.zip
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
