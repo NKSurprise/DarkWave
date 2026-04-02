@@ -35,12 +35,6 @@ func loginScreen(w fyne.Window) fyne.CanvasObject {
 	subtitle := widget.NewLabel("connect to the wave")
 	subtitle.Alignment = fyne.TextAlignCenter
 
-	nickEntry := widget.NewEntry()
-	nickEntry.SetPlaceHolder("nickname")
-
-	passEntry := widget.NewPasswordEntry()
-	passEntry.SetPlaceHolder("password")
-
 	statusLabel := widget.NewLabel("")
 	statusLabel.Alignment = fyne.TextAlignCenter
 
@@ -70,19 +64,29 @@ func loginScreen(w fyne.Window) fyne.CanvasObject {
 
 	colorRow := container.NewHBox(redBtn, blueBtn, greenBtn, purpleBtn)
 
+	serverEntry := widget.NewEntry()
+	serverEntry.SetPlaceHolder("server address (e.g. 192.168.1.1:3000)")
+	serverEntry.SetText("localhost:3000")
+
+	nickEntry := widget.NewEntry()
+	nickEntry.SetPlaceHolder("nickname")
+
+	passEntry := widget.NewPasswordEntry()
+	passEntry.SetPlaceHolder("password")
+
 	connectBtn := widget.NewButton("Connect", func() {
 		nick := nickEntry.Text
 		pass := passEntry.Text
+		server := serverEntry.Text // ← reads what user typed
 
-		if nick == "" || pass == "" {
-			statusLabel.SetText("⚠ please enter nick and password")
+		if nick == "" || pass == "" || server == "" {
+			statusLabel.SetText("⚠ please fill all fields")
 			return
 		}
 
 		statusLabel.SetText("connecting...")
-
 		go func() {
-			conn, err := connect("localhost:3000", nick, pass)
+			conn, err := connect(server, nick, pass)
 			if err != nil {
 				fyne.Do(func() {
 					statusLabel.SetText("⚠ could not connect to server")
@@ -92,7 +96,7 @@ func loginScreen(w fyne.Window) fyne.CanvasObject {
 			fyne.Do(func() {
 				w.Resize(fyne.NewSize(1000, 650))
 				w.CenterOnScreen()
-				w.SetContent(chatScreen(w, conn, nick))
+				w.SetContent(chatScreen(w, conn, nick, server))
 			})
 		}()
 	})
@@ -100,6 +104,7 @@ func loginScreen(w fyne.Window) fyne.CanvasObject {
 
 	form := container.NewVBox(
 		widget.NewSeparator(),
+		serverEntry,
 		nickEntry,
 		passEntry,
 		widget.NewSeparator(),

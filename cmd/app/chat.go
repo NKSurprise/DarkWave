@@ -25,7 +25,7 @@ type VoiceMember struct {
 	speaking bool
 }
 
-func chatScreen(w fyne.Window, conn *Connection, myNick string) fyne.CanvasObject {
+func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr string) fyne.CanvasObject {
 	var msgs []string
 	var friends []FriendStatus
 	var currentRoom string
@@ -296,7 +296,8 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string) fyne.CanvasObjec
 							})
 						}
 
-						wsAddr := "ws://localhost:3001"
+						wsPort := strings.Replace(serverAddr, ":3000", ":3001", 1)
+						wsAddr := "ws://" + wsPort
 						roomName := strings.TrimPrefix(r.name, "#")
 						err := voiceClient.JoinChannel(wsAddr, roomName+"/"+channelName)
 						if err != nil {
