@@ -12,17 +12,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.24'
-
       - name: Install MSYS2 and dependencies
         uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
           update: true
           install: >-
+            mingw-w64-ucrt-x86_64-go
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-portaudio
             mingw-w64-ucrt-x86_64-opus
@@ -31,11 +27,11 @@ jobs:
             mingw-w64-ucrt-x86_64-pkg-config
 
       - name: Build Windows
-  shell: msys2 {0}
-  run: |
-    export PATH="/ucrt64/lib/go/bin:$PATH"
-    export GOROOT=/ucrt64/lib/go
-    go build -o DarkWave-windows.exe ./cmd/app/
+        shell: msys2 {0}
+        run: |
+          export GOROOT=/ucrt64/lib/go
+          export PATH="/ucrt64/lib/go/bin:$PATH"
+          go build -o DarkWave-windows.exe ./cmd/app/
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
@@ -54,26 +50,25 @@ jobs:
           go-version: '1.24'
 
       - name: Install dependencies
-  run: |
-    sudo apt-get update
-    sudo apt-get install -y \
-      gcc \
-      libportaudio2 \
-      portaudio19-dev \
-      libopus-dev \
-      libopusfile-dev \
-      pkg-config \
-      libgl1-mesa-dev \
-      xorg-dev \
-      cmake
-    # build rnnoise from source
-    git clone https://github.com/xiph/rnnoise.git
-    cd rnnoise
-    mkdir build && cd build
-    cmake ..
-    make
-    sudo make install
-    sudo ldconfig
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc \
+            libportaudio2 \
+            portaudio19-dev \
+            libopus-dev \
+            libopusfile-dev \
+            pkg-config \
+            libgl1-mesa-dev \
+            xorg-dev \
+            cmake
+          git clone https://github.com/xiph/rnnoise.git
+          cd rnnoise
+          mkdir build && cd build
+          cmake ..
+          make
+          sudo make install
+          sudo ldconfig
 
       - name: Build Linux
         run: |
@@ -96,15 +91,16 @@ jobs:
           go-version: '1.24'
 
       - name: Install dependencies
-  run: |
-    brew install portaudio opus opusfile pkg-config
-    brew install rnnoise || true
-    # if rnnoise not in brew, build from source
-    if ! pkg-config --exists rnnoise; then
-      git clone https://github.com/xiph/rnnoise.git
-      cd rnnoise && mkdir build && cd build
-      cmake .. && make && sudo make install
-    fi
+        run: |
+          brew install portaudio opus opusfile pkg-config cmake
+          if ! pkg-config --exists rnnoise; then
+            git clone https://github.com/xiph/rnnoise.git
+            cd rnnoise
+            mkdir build && cd build
+            cmake ..
+            make
+            sudo make install
+          fi
 
       - name: Build Mac
         run: |
