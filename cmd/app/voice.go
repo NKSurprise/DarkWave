@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -33,8 +34,10 @@ type VoiceClient struct {
 	onSpeaking    func(nick string, speaking bool)
 	onMemberJoin  func(nick string)
 	onMemberLeave func(nick string)
-	audioMu       sync.Mutex        // ← protect audio streams
-	outputStream  *portaudio.Stream // ← track output stream
+	audioMu       sync.Mutex                       // protects stream, outputStream
+	outputStream  *portaudio.Stream                // current output stream (owned by playAudio)
+	outputGen     uint32                           // atomic; increment to tell playAudio to reopen output
+	micTracks     []*webrtc.TrackLocalStaticSample // active mic tracks for RestartAudio
 }
 
 type SignalMsg struct {
@@ -105,15 +108,53 @@ func (vc *VoiceClient) LeaveChannel() {
 		pc.Close()
 	}
 	vc.pc = make(map[string]*webrtc.PeerConnection)
+	vc.micTracks = nil
 	vc.mu.Unlock()
+	// close audio streams before Terminate
+	vc.audioMu.Lock()
 	if vc.stream != nil {
 		vc.stream.Stop()
 		vc.stream.Close()
 		vc.stream = nil
 	}
+	if vc.outputStream != nil {
+		vc.outputStream.Stop()
+		vc.outputStream.Close()
+		vc.outputStream = nil
+	}
+	vc.audioMu.Unlock()
 	vc.ws.Close()
 	vc.isConnected = false
 	portaudio.Terminate()
+}
+
+// RestartAudio signals playAudio to reopen the output stream on the next packet
+// (no abrupt close — avoids races with Write()), and restarts mic capture.
+func (vc *VoiceClient) RestartAudio() {
+	// Signal output switch. playAudio checks this after each Write() and reopens
+	// gracefully with the new vc.outputDevice. We must NOT close vc.outputStream
+	// here — that would race with an in-progress Write().
+	atomic.AddUint32(&vc.outputGen, 1)
+
+	// Restart mic input stream.
+	vc.audioMu.Lock()
+	if vc.stream != nil {
+		vc.stream.Stop()
+		vc.stream.Close()
+		vc.stream = nil
+	}
+	vc.audioMu.Unlock()
+
+	// Give old captureMic goroutine time to exit before relaunching.
+	time.Sleep(80 * time.Millisecond)
+
+	vc.mu.Lock()
+	micTracks := make([]*webrtc.TrackLocalStaticSample, len(vc.micTracks))
+	copy(micTracks, vc.micTracks)
+	vc.mu.Unlock()
+	for _, t := range micTracks {
+		go vc.captureMic(t)
+	}
 }
 
 func (vc *VoiceClient) send(msg SignalMsg) {
@@ -199,7 +240,20 @@ func (vc *VoiceClient) newPeerConnection() (*webrtc.PeerConnection, error) {
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{
-				URLs: []string{"stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302", "stun:stun2.l.google.com:19302"},
+				URLs: []string{
+					"stun:stun.l.google.com:19302",
+					"stun:stun1.l.google.com:19302",
+					"stun:stun2.l.google.com:19302",
+				},
+			},
+			{
+				URLs: []string{
+					"turn:openrelay.metered.ca:80",
+					"turn:openrelay.metered.ca:443",
+					"turn:openrelay.metered.ca:443?transport=tcp",
+				},
+				Username:   "openrelayproject",
+				Credential: "openrelayproject",
 			},
 		},
 	}
@@ -248,6 +302,10 @@ func (vc *VoiceClient) initiateCall(targetNick string) {
 	fmt.Println("VOICE: adding track to PC for", targetNick)
 	pc.AddTrack(audioTrack)
 
+	// track this for RestartAudio
+	vc.mu.Lock()
+	vc.micTracks = append(vc.micTracks, audioTrack)
+	vc.mu.Unlock()
 	// start mic capture to this track
 	go vc.captureMic(audioTrack)
 
@@ -354,6 +412,10 @@ func (vc *VoiceClient) handleOffer(fromNick, payload string) {
 		}
 		fmt.Println("VOICE: adding track to PC for", fromNick)
 		pc.AddTrack(audioTrack)
+		// track this for RestartAudio
+		vc.mu.Lock()
+		vc.micTracks = append(vc.micTracks, audioTrack)
+		vc.mu.Unlock()
 		go vc.captureMic(audioTrack)
 	}
 
@@ -474,7 +536,9 @@ func (vc *VoiceClient) captureMic(track *webrtc.TrackLocalStaticSample) {
 		return
 	}
 	fmt.Println("VOICE: captureMic - stream opened successfully")
+	vc.audioMu.Lock()
 	vc.stream = stream
+	vc.audioMu.Unlock()
 	stream.Start()
 	fmt.Println("VOICE: captureMic - stream started, entering read loop")
 	defer stream.Stop()
@@ -568,61 +632,60 @@ func (vc *VoiceClient) captureMic(track *webrtc.TrackLocalStaticSample) {
 }
 
 func (vc *VoiceClient) playAudio(track *webrtc.TrackRemote) {
-	defer func() {
-		if r := recover(); r != nil {
-			fmt.Printf("VOICE: playAudio PANIC: %v\n", r)
-		}
-	}()
-
-	vc.audioMu.Lock()
-	// close existing output stream if any
-	if vc.outputStream != nil {
-		vc.outputStream.Stop()
-		vc.outputStream.Close()
-		vc.outputStream = nil
-	}
-	fmt.Println("VOICE: playAudio started")
-	fmt.Printf("VOICE: playAudio - track codec: %v\n", track.Codec())
+	fmt.Println("VOICE: playAudio started, codec:", track.Codec().MimeType)
 	sampleRate := 48000
 	channels := 1
 	framesPerBuffer := 960
 	buf := make([]int16, framesPerBuffer)
 
-	var stream *portaudio.Stream
-	var err error
-
-	fmt.Println("VOICE: playAudio - opening output device...")
-	if vc.outputDevice != nil {
-		fmt.Printf("VOICE: playAudio - using device: %v\n", vc.outputDevice.Name)
-		params := portaudio.StreamParameters{
-			Output: portaudio.StreamDeviceParameters{
-				Device:   vc.outputDevice,
-				Channels: channels,
-				Latency:  vc.outputDevice.DefaultLowOutputLatency,
-			},
-			SampleRate:      float64(sampleRate),
-			FramesPerBuffer: framesPerBuffer,
+	// openStream closes any previous output stream and opens a fresh one.
+	// Must be called only from the playAudio goroutine.
+	openStream := func() *portaudio.Stream {
+		vc.audioMu.Lock()
+		defer vc.audioMu.Unlock()
+		if vc.outputStream != nil {
+			vc.outputStream.Stop()
+			vc.outputStream.Close()
+			vc.outputStream = nil
 		}
-		stream, err = portaudio.OpenStream(params, buf)
-	} else {
-		fmt.Println("VOICE: playAudio - using default output device")
-		stream, err = portaudio.OpenDefaultStream(0, channels, float64(sampleRate), framesPerBuffer, buf)
+		var s *portaudio.Stream
+		var err error
+		if vc.outputDevice != nil {
+			fmt.Printf("VOICE: playAudio - opening device: %v\n", vc.outputDevice.Name)
+			params := portaudio.StreamParameters{
+				Output: portaudio.StreamDeviceParameters{
+					Device:   vc.outputDevice,
+					Channels: channels,
+					Latency:  vc.outputDevice.DefaultLowOutputLatency,
+				},
+				SampleRate:      float64(sampleRate),
+				FramesPerBuffer: framesPerBuffer,
+			}
+			s, err = portaudio.OpenStream(params, buf)
+		} else {
+			s, err = portaudio.OpenDefaultStream(0, channels, float64(sampleRate), framesPerBuffer, buf)
+		}
+		if err != nil {
+			fmt.Printf("VOICE: playAudio - stream open failed: %v\n", err)
+			return nil
+		}
+		s.Start()
+		vc.outputStream = s
+		fmt.Println("VOICE: playAudio - stream ready")
+		return s
 	}
-	if err != nil {
-		fmt.Printf("VOICE: playAudio - stream open failed: %v\n", err)
-		vc.audioMu.Unlock()
+
+	stream := openStream()
+	if stream == nil {
 		return
 	}
-	fmt.Println("VOICE: playAudio - stream opened, starting...")
-	stream.Start()
-	vc.outputStream = stream
-	vc.audioMu.Unlock()
-	fmt.Println("VOICE: playAudio - stream started successfully")
+	// Cleanup when this goroutine exits (e.g. RTP error on disconnect).
+	// LeaveChannel may have already closed it; the pointer check makes it safe.
 	defer func() {
 		vc.audioMu.Lock()
-		stream.Stop()
-		stream.Close()
 		if vc.outputStream == stream {
+			stream.Stop()
+			stream.Close()
 			vc.outputStream = nil
 		}
 		vc.audioMu.Unlock()
@@ -634,29 +697,39 @@ func (vc *VoiceClient) playAudio(track *webrtc.TrackRemote) {
 		return
 	}
 
-	rx_count := 0
-	for {
-		fmt.Println("voice: waiting for RTP packet...")
+	// Track the generation we were opened at. RestartAudio increments outputGen
+	// to request a device switch. We check after each Write() — no concurrent close.
+	myGen := atomic.LoadUint32(&vc.outputGen)
+
+	for vc.isConnected {
 		pkt, _, err := track.ReadRTP()
 		if err != nil {
 			fmt.Println("voice: RTP read error:", err)
 			return
 		}
-		rx_count++
-		fmt.Printf("voice: received RTP packet #%d, %d bytes, seq=%d, ts=%d\n", rx_count, len(pkt.Payload), pkt.SequenceNumber, pkt.Timestamp)
-		n, err := dec.Decode(pkt.Payload, buf)
+		_, err = dec.Decode(pkt.Payload, buf)
 		if err != nil {
 			fmt.Println("voice: decode error:", err)
 			continue
 		}
-		fmt.Printf("voice: decoded %d samples\n", n)
-		vc.audioMu.Lock()
-		writeErr := stream.Write()
-		vc.audioMu.Unlock()
-		if writeErr != nil {
-			fmt.Println("voice: write error:", writeErr)
-			return
+
+		// Write to the current stream. No lock held — write is blocking (~20ms)
+		// and RestartAudio never touches vc.outputStream, so there is no race.
+		if err := stream.Write(); err != nil {
+			fmt.Println("voice: write error, reopening:", err)
+			// Treat a write error the same as a device switch request.
+			atomic.AddUint32(&vc.outputGen, 1)
 		}
-		fmt.Println("voice: audio sample played")
+
+		// After each write, check if a device switch was requested.
+		curGen := atomic.LoadUint32(&vc.outputGen)
+		if curGen != myGen {
+			myGen = curGen
+			newStream := openStream()
+			if newStream == nil {
+				return
+			}
+			stream = newStream
+		}
 	}
 }
