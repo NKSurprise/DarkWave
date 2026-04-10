@@ -77,13 +77,22 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            gcc pkg-config \
+            gcc pkg-config autoconf automake libtool \
             libportaudio2 portaudio19-dev \
             libopus-dev libopusfile-dev \
-            librnnoise-dev \
             libgl1-mesa-dev \
             xorg-dev \
             libxcursor-dev libxrandr-dev libxinerama-dev libxi-dev
+
+      - name: Build and install rnnoise from source
+        run: |
+          git clone https://gitlab.xiph.org/xiph/rnnoise.git
+          cd rnnoise
+          ./autogen.sh
+          ./configure
+          make
+          sudo make install
+          sudo ldconfig
 
       - name: Build Linux
         run: CGO_ENABLED=1 go build -o DarkWave-linux ./cmd/app/
@@ -112,7 +121,16 @@ jobs:
 
       - name: Install dependencies
         run: |
-          brew install portaudio opus opusfile pkg-config rnnoise
+          brew install portaudio opus opusfile pkg-config autoconf automake libtool
+
+      - name: Build and install rnnoise from source
+        run: |
+          git clone https://gitlab.xiph.org/xiph/rnnoise.git
+          cd rnnoise
+          ./autogen.sh
+          ./configure --prefix=$(brew --prefix)
+          make
+          sudo make install
 
       - name: Build Mac
         env:
