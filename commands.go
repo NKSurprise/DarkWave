@@ -237,6 +237,17 @@ func (s *Server) handleCommand(c *Client, cmd string, r *bufio.Reader) {
 		room := s.getOrCreateRoom(retName, id)
 		room.Name = retName
 		s.joinRoom(c, room)
+
+		// Send updated rooms list to client so they see the new room
+		names, err := s.repo.getUserRooms(context.Background(), c.UserID)
+		if err == nil {
+			if len(names) == 0 {
+				s.sendLine(c, "** rooms: (none)")
+			} else {
+				s.sendLine(c, "** rooms: %s", strings.Join(names, ", "))
+			}
+		}
+
 		// load recent messages
 		msgs, err := s.repo.GetRecentMessagesWithUsers(room.ID)
 		if err != nil {

@@ -305,6 +305,11 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 		case liMember:
 			roomsList.Unselect(i)
 		case liRoom:
+			// Bounds check to prevent crash
+			if item.roomIdx >= len(roomsWithVoice) {
+				fmt.Printf("WARNING: roomIdx %d out of bounds (len=%d)\n", item.roomIdx, len(roomsWithVoice))
+				return
+			}
 			r := roomsWithVoice[item.roomIdx]
 			currentRoom = r.name
 			isDM = false
@@ -313,17 +318,28 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 			membersList.Refresh()
 			conn.send("/join " + r.name)
 			conn.send("/voicechannels")
+			conn.send("/rooms") // Refresh rooms list after joining
 			msgs = []string{}
 			msgList.Refresh()
 			center.Objects = []fyne.CanvasObject{chatWithMembers}
 			center.Refresh()
 			chatWithMembers.SetOffset(0.75)
-			leaveBtn.Show()
+			// Only show leave button if not in #main
+			if r.name != "main" {
+				leaveBtn.Show()
+			} else {
+				leaveBtn.Hide()
+			}
 			// clear stale member data from previous room
 			pollChansMu.Lock()
 			pollChans = nil
 			pollChansMu.Unlock()
 		case liChannel:
+			// Bounds check to prevent crash
+			if item.roomIdx >= len(roomsWithVoice) {
+				fmt.Printf("WARNING: roomIdx %d out of bounds in liChannel (len=%d)\n", item.roomIdx, len(roomsWithVoice))
+				return
+			}
 			r := roomsWithVoice[item.roomIdx]
 			channelName := item.chanName
 			go func() {
@@ -418,8 +434,7 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 	// -- INCOMING MESSAGES --
 	go func() {
 		for msg := range conn.incoming {
-			msg := msg                       // capture
-			fmt.Println("CLIENT RECV:", msg) // DEBUG
+			msg := msg // capture
 			fyne.Do(func() {
 				if strings.HasPrefix(msg, "** friends: ") {
 					raw := strings.TrimPrefix(msg, "** friends: ")
