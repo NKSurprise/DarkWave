@@ -41,8 +41,28 @@ func NewSignalServer() *SignalServer {
 
 func (ss *SignalServer) Start(addr string) {
 	http.HandleFunc("/ws", ss.handleWS)
+	http.HandleFunc("/members", ss.handleMembers)
 	fmt.Println("signal server listening on", addr)
 	go http.ListenAndServe(addr, nil)
+}
+
+// handleMembers returns the nicks currently in a given voice channel.
+// GET /members?channel=roomname/channelname
+func (ss *SignalServer) handleMembers(w http.ResponseWriter, r *http.Request) {
+	channel := r.URL.Query().Get("channel")
+	ss.mu.RLock()
+	var nicks []string
+	for nick, vc := range ss.clients {
+		if vc.channel == channel {
+			nicks = append(nicks, nick)
+		}
+	}
+	ss.mu.RUnlock()
+	if nicks == nil {
+		nicks = []string{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(nicks)
 }
 
 func (ss *SignalServer) handleWS(w http.ResponseWriter, r *http.Request) {
