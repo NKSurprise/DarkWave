@@ -25,27 +25,31 @@ jobs:
             mingw-w64-ucrt-x86_64-opusfile
             mingw-w64-ucrt-x86_64-rnnoise
             mingw-w64-ucrt-x86_64-pkg-config
+            mingw-w64-ucrt-x86_64-mesa
 
       - name: Build Windows
         shell: msys2 {0}
         run: |
           export GOROOT=/ucrt64/lib/go
           export PATH="/ucrt64/lib/go/bin:$PATH"
-          go build -o DarkWave.exe ./cmd/app/
+          go build -ldflags="-H windowsgui" -o DarkWave.exe ./cmd/app/
           mkdir DarkWave-windows
           mv DarkWave.exe DarkWave-windows/
-          cp /ucrt64/bin/libportaudio.dll DarkWave-windows/
-          cp /ucrt64/bin/libopus-0.dll DarkWave-windows/
-          cp /ucrt64/bin/libopusfile-0.dll DarkWave-windows/
-          cp /ucrt64/bin/librnnoise-0.dll DarkWave-windows/
-          cp /ucrt64/bin/libgcc_s_seh-1.dll DarkWave-windows/ || true
-          cp /ucrt64/bin/libstdc++-6.dll DarkWave-windows/ || true
-          cp /ucrt64/bin/libwinpthread-1.dll DarkWave-windows/ || true
+          # Core audio/codec DLLs
+          for dll in libportaudio.dll libopus-0.dll libopusfile-0.dll librnnoise-0.dll \
+                     libogg-0.dll libffi-8.dll libiconv-2.dll libintl-8.dll \
+                     libsystre-0.dll libtre-5.dll libxml2-16.dll libzstd.dll zlib1.dll \
+                     libgcc_s_seh-1.dll libstdc++-6.dll libwinpthread-1.dll; do
+            cp /ucrt64/bin/$dll DarkWave-windows/ || true
+          done
+          # OpenGL/Mesa DLLs (needed by Fyne on machines without a proper GPU driver)
+          for dll in opengl32.dll libgallium_wgl.dll libLLVM-21.dll libSPIRV-Tools.dll; do
+            cp /ucrt64/bin/$dll DarkWave-windows/ || true
+          done
 
       - name: Zip Windows build
         shell: pwsh
-        run: |
-          Compress-Archive -Path DarkWave-windows -DestinationPath DarkWave-windows.zip
+        run: Compress-Archive -Path DarkWave-windows -DestinationPath DarkWave-windows.zip
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
@@ -72,16 +76,17 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc libportaudio2 portaudio19-dev libopus-dev libopusfile-dev pkg-config libgl1-mesa-dev xorg-dev cmake autoconf automake libtool
-
-      - name: Build rnnoise
-        run: |
-          git clone https://github.com/xiph/rnnoise.git
-          cd rnnoise && ./autogen.sh && ./configure && make && sudo make install && sudo ldconfig
+          sudo apt-get install -y \
+            gcc pkg-config \
+            libportaudio2 portaudio19-dev \
+            libopus-dev libopusfile-dev \
+            librnnoise-dev \
+            libgl1-mesa-dev \
+            xorg-dev \
+            libxcursor-dev libxrandr-dev libxinerama-dev libxi-dev
 
       - name: Build Linux
-        run: |
-          go build -o DarkWave-linux ./cmd/app/
+        run: CGO_ENABLED=1 go build -o DarkWave-linux ./cmd/app/
 
       - name: Upload Linux artifact
         uses: actions/upload-artifact@v4
@@ -107,16 +112,16 @@ jobs:
 
       - name: Install dependencies
         run: |
-          brew install portaudio opus opusfile pkg-config cmake autoconf automake libtool
-
-      - name: Build rnnoise
-        run: |
-          git clone https://github.com/xiph/rnnoise.git
-          cd rnnoise && ./autogen.sh && ./configure && make && sudo make install
+          brew install portaudio opus opusfile pkg-config rnnoise
 
       - name: Build Mac
-        run: |
-          go build -o DarkWave-mac ./cmd/app/
+        env:
+          # macos-latest is Apple Silicon; Homebrew lives at /opt/homebrew
+          PKG_CONFIG_PATH: /opt/homebrew/lib/pkgconfig
+          CGO_CFLAGS: -I/opt/homebrew/include
+          CGO_LDFLAGS: -L/opt/homebrew/lib
+          CGO_ENABLED: 1
+        run: go build -o DarkWave-mac ./cmd/app/
 
       - name: Upload Mac artifact
         uses: actions/upload-artifact@v4
