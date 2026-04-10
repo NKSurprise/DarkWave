@@ -6,7 +6,9 @@ import (
 	"time"
 )
 
-func (s *Server) getOrCreateRoom(name string) *Room {
+// getOrCreateRoom fetches an existing room or creates a new one
+// if roomID > 0, it sets the ID on a newly created room (fixes race condition)
+func (s *Server) getOrCreateRoom(name string, roomID int64) *Room {
 	if name == "" {
 		name = "#main"
 	}
@@ -16,9 +18,14 @@ func (s *Server) getOrCreateRoom(name string) *Room {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if r, ok := s.rooms[name]; ok {
+		// If room ID was 0 and we now have one, update it
+		if r.ID == 0 && roomID > 0 {
+			r.ID = roomID
+		}
 		return r
 	}
 	r := &Room{
+		ID:      roomID,
 		Name:    name,
 		Inbox:   make(chan Message, 256),
 		clients: make(map[*Client]struct{}),

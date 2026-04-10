@@ -7,7 +7,10 @@ func (s *Server) dispatchLoop() {
 
 		// go func(msg Message) {       <--- - if we wanted to save asynchronously (not blocking the dispatch loop)
 		if err := s.repo.SaveMessage(m); err != nil {
-			fmt.Println("failed to save message:", err)
+			fmt.Printf("ERROR: failed to save message from %s to room %d: %v\n", m.from.nick, m.room.ID, err)
+			fmt.Printf("  RoomID: %d, FromID: %d, Payload: %q\n", m.room.ID, m.from.UserID, string(m.payload))
+		} else {
+			fmt.Printf("✓ Message saved: room=%d, from=%s (ID:%d), len=%d\n", m.room.ID, m.from.nick, m.from.UserID, len(m.payload))
 		}
 		// }(m)
 

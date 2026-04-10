@@ -1,6 +1,10 @@
 package main
 
-import "context"
+import (
+	"context"
+	"fmt"
+	"strings"
+)
 
 func (r *Repo) listRooms() ([]string, error) {
 	rows, err := r.pool.Query(context.Background(), `
@@ -37,6 +41,11 @@ func (r *Repo) UpsertRoomByName(ctx context.Context, name string, creatorID int6
         on conflict(name) do update set name = excluded.name
         returning id, name
     `, name, creatorID).Scan(&id, &retName)
+	if err != nil {
+		fmt.Printf("ERROR UpsertRoomByName: name=%s, creatorID=%d, err=%v\n", name, creatorID, err)
+	} else {
+		fmt.Printf("✓ UpsertRoomByName: name=%s, roomID=%d\n", retName, id)
+	}
 	return id, retName, err
 }
 
@@ -216,7 +225,7 @@ func (r *Repo) GetRecentMessagesWithUsers(roomID int64) ([]MessageWithSender, er
 		FROM messages m
 		JOIN clients c ON m.from_id = c.id
 		WHERE m.room_id = $1
-		ORDER BY m.sent_at DESC
+		ORDER BY m.sent_at ASC
 		LIMIT 50
 	`, roomID)
 	if err != nil {
@@ -236,11 +245,17 @@ func (r *Repo) GetRecentMessagesWithUsers(roomID int64) ([]MessageWithSender, er
 }
 
 func (r *Repo) addUserToRoom(ctx context.Context, userID, roomID int64) error {
-	_, err := r.pool.Exec(ctx, `
+	res, err := r.pool.Exec(ctx, `
         insert into room_members(user_id, room_id, joined_at)
         values ($1, $2, now())
         on conflict do nothing
     `, userID, roomID)
+	if err != nil {
+		fmt.Printf("ERROR addUserToRoom: user=%d, room=%d, err=%v\n", userID, roomID, err)
+	} else {
+		affected := res.RowsAffected()
+		fmt.Printf("✓ addUserToRoom: user=%d, room=%d, affected=%d\n", userID, roomID, affected)
+	}
 	return err
 }
 
@@ -256,8 +271,10 @@ func (r *Repo) getUserRooms(ctx context.Context, userID int64) ([]string, error)
         select ro.name from rooms ro
         join room_members rm on rm.room_id = ro.id
         where rm.user_id = $1
+        order by ro.name
     `, userID)
 	if err != nil {
+		fmt.Printf("ERROR getUserRooms query: userID=%d, err=%v\n", userID, err)
 		return nil, err
 	}
 	defer rows.Close()
@@ -265,8 +282,13 @@ func (r *Repo) getUserRooms(ctx context.Context, userID int64) ([]string, error)
 	for rows.Next() {
 		var name string
 		rows.Scan(&name)
+		// Ensure non-DM rooms have # prefix for consistency
+		if !strings.HasPrefix(name, "dm:") && !strings.HasPrefix(name, "#") {
+			name = "#" + name
+		}
 		names = append(names, name)
 	}
+	fmt.Printf("✓ getUserRooms: userID=%d, found %d rooms: %v\n", userID, len(names), names)
 	return names, nil
 }
 

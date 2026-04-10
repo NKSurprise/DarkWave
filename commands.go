@@ -14,11 +14,16 @@ const helpText = "" +
 	"  /nick <name>          set your nickname\n" +
 	"  /rooms                list available rooms\n" +
 	"  /join <room>          join or create a room (e.g., /join main)\n" +
+	"  /leave                leave current room\n" +
 	"  /friends              list your friends\n" +
 	"  /addfriend <nick>     add a friend by nickname\n" +
+	"  /dm <nick>            open encrypted DM\n" +
 	"  /friendreqs           list pending friend requests\n" +
 	"  /acceptfriend <nick>  accept a friend request\n" +
 	"  /declinefriend <nick> decline a friend request\n" +
+	"  /online               check online status of friends\n" +
+	"  /createvoice <name>   create a voice channel (room creator only)\n" +
+	"  /voicechannels        list voice channels in current room\n" +
 	"  /quit                 disconnect\n"
 
 func cleanInput(s string) string {
@@ -175,9 +180,35 @@ func (s *Server) handleCommand(c *Client, cmd string, r *bufio.Reader) {
 		s.registerClientSingle(c)
 		s.notifyFriendsOnline(c)
 
-		mainRoom := s.getOrCreateRoom("#main")
+		// Ensure #main room exists in database with correct ID
+		mainID, mainName, err := s.repo.UpsertRoomByName(context.Background(), "#main", id)
+		if err != nil {
+			s.sendLine(c, "** warning: could not ensure main room: %v", err)
+		}
+
+		// Add user to #main room in database (non-fatal if fails)
+		if err := s.repo.addUserToRoom(context.Background(), id, mainID); err != nil {
+			fmt.Printf("WARNING: failed to add user %d to room #main (ID=%d): %v\n", id, mainID, err)
+		}
+
+		// Get room from server cache, ensure it has the correct ID from database
+		mainRoom := s.getOrCreateRoom(mainName, mainID)
 		s.joinRoom(c, mainRoom)
 		_ = s.sendLine(c, "** connected. type /help | /?")
+
+		// Send user their rooms list so they see #main
+		names, err := s.repo.getUserRooms(context.Background(), id)
+		if err != nil {
+			fmt.Printf("WARNING: failed to fetch rooms for user %d: %v\n", id, err)
+			// fallback: at least show #main
+			s.sendLine(c, "** rooms: #main")
+		} else {
+			if len(names) == 0 {
+				s.sendLine(c, "** rooms: (none)")
+			} else {
+				s.sendLine(c, "** rooms: %s", strings.Join(names, ", "))
+			}
+		}
 
 		// load recent messages
 		msgs, err := s.repo.GetRecentMessagesWithUsers(mainRoom.ID)
@@ -203,8 +234,7 @@ func (s *Server) handleCommand(c *Client, cmd string, r *bufio.Reader) {
 			s.sendLine(c, "** error joining room: %v", err)
 			return
 		}
-		room := s.getOrCreateRoom(retName)
-		room.ID = id
+		room := s.getOrCreateRoom(retName, id)
 		room.Name = retName
 		s.joinRoom(c, room)
 		// load recent messages
@@ -362,8 +392,7 @@ func (s *Server) handleCommand(c *Client, cmd string, r *bufio.Reader) {
 			s.sendLine(c, "** error creating dm: %v", err)
 			return
 		}
-		room := s.getOrCreateRoom(retName)
-		room.ID = id
+		room := s.getOrCreateRoom(retName, id)
 		room.Name = retName
 		s.joinRoom(c, room)
 		// tell client who they're DMing and what the room is

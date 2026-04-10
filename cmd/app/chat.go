@@ -418,7 +418,8 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 	// -- INCOMING MESSAGES --
 	go func() {
 		for msg := range conn.incoming {
-			msg := msg // capture
+			msg := msg                       // capture
+			fmt.Println("CLIENT RECV:", msg) // DEBUG
 			fyne.Do(func() {
 				if strings.HasPrefix(msg, "** friends: ") {
 					raw := strings.TrimPrefix(msg, "** friends: ")
@@ -439,9 +440,13 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 						allRooms := strings.Split(raw, ", ")
 						roomsWithVoice = []RoomWithVoice{}
 						for _, r := range allRooms {
-							if !strings.HasPrefix(r, "dm:") {
-								roomsWithVoice = append(roomsWithVoice, RoomWithVoice{name: r})
+							// DMs are handled separately
+							if strings.HasPrefix(r, "dm:") {
+								continue
 							}
+							// Remove leading # for storage (display logic adds it back)
+							displayName := strings.TrimPrefix(r, "#")
+							roomsWithVoice = append(roomsWithVoice, RoomWithVoice{name: displayName})
 						}
 						roomsList.Refresh()
 					}

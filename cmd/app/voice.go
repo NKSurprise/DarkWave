@@ -606,7 +606,7 @@ func (vc *VoiceClient) captureMic(track *webrtc.TrackLocalStaticSample) {
 			buf[i] = int16(f)
 		}
 
-		isVoice := vad > 0.0 // VAD threshold (disabled: always transmit for testing)
+		isVoice := vad > 0.4
 
 		if isVoice != lastSpeakingStatus && time.Since(lastStatusTime) > 200*time.Millisecond {
 			lastSpeakingStatus = isVoice
@@ -624,8 +624,11 @@ func (vc *VoiceClient) captureMic(track *webrtc.TrackLocalStaticSample) {
 			})
 		}
 
-		// VAD gate disabled for testing — transmit all frames unconditionally
-		_ = isVoice
+		// VAD gate — drop silent frames and reset accumulator to avoid partial chunks.
+		if !isVoice {
+			accumCount = 0
+			continue
+		}
 
 		// accumulate into 960-frame buffer
 		copy(accumBuf[accumCount*480:], buf)
