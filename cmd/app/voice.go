@@ -98,19 +98,27 @@ func (vc *VoiceClient) LeaveChannel() {
 	if !vc.isConnected {
 		return
 	}
+	// Set isConnected = false FIRST so all captureMic/playAudio goroutines
+	// exit their loops on the next iteration check.
+	vc.isConnected = false
 	vc.send(SignalMsg{
 		Type:    "leave",
 		From:    vc.myNick,
 		Channel: vc.channel,
 	})
 	vc.mu.Lock()
+	pcs := make([]*webrtc.PeerConnection, 0, len(vc.pc))
 	for _, pc := range vc.pc {
-		pc.Close()
+		pcs = append(pcs, pc)
 	}
 	vc.pc = make(map[string]*webrtc.PeerConnection)
 	vc.micTracks = nil
 	vc.mu.Unlock()
-	// close audio streams before Terminate
+	// Close PCs in goroutines — TURN teardown can block for seconds.
+	for _, pc := range pcs {
+		go pc.Close()
+	}
+	// Close streams to unblock any goroutine currently blocked in stream.Read/Write.
 	vc.audioMu.Lock()
 	if vc.stream != nil {
 		vc.stream.Stop()
@@ -124,7 +132,6 @@ func (vc *VoiceClient) LeaveChannel() {
 	}
 	vc.audioMu.Unlock()
 	vc.ws.Close()
-	vc.isConnected = false
 	portaudio.Terminate()
 }
 
@@ -171,6 +178,18 @@ func (vc *VoiceClient) readLoop() {
 	for {
 		_, data, err := vc.ws.ReadMessage()
 		if err != nil {
+			// WS closed — clean up any peers that didn't send a leave message.
+			if vc.onMemberLeave != nil {
+				vc.mu.Lock()
+				peerNicks := make([]string, 0, len(vc.pc))
+				for nick := range vc.pc {
+					peerNicks = append(peerNicks, nick)
+				}
+				vc.mu.Unlock()
+				for _, nick := range peerNicks {
+					vc.onMemberLeave(nick)
+				}
+			}
 			return
 		}
 		var msg SignalMsg
@@ -223,11 +242,14 @@ func (vc *VoiceClient) readLoop() {
 				vc.onMemberLeave(msg.From)
 			}
 			vc.mu.Lock()
-			if pc, ok := vc.pc[msg.From]; ok {
-				pc.Close()
+			pc, ok := vc.pc[msg.From]
+			if ok {
 				delete(vc.pc, msg.From)
 			}
 			vc.mu.Unlock()
+			if ok {
+				go pc.Close()
+			}
 		case "speaking":
 			if vc.onSpeaking != nil {
 				vc.onSpeaking(msg.From, msg.Payload == "speaking")
@@ -244,16 +266,19 @@ func (vc *VoiceClient) newPeerConnection() (*webrtc.PeerConnection, error) {
 					"stun:stun.l.google.com:19302",
 					"stun:stun1.l.google.com:19302",
 					"stun:stun2.l.google.com:19302",
+					"stun:stun3.l.google.com:19302",
+					"stun:stun4.l.google.com:19302",
 				},
 			},
 			{
-				URLs: []string{
-					"turn:openrelay.metered.ca:80",
-					"turn:openrelay.metered.ca:443",
-					"turn:openrelay.metered.ca:443?transport=tcp",
-				},
-				Username:   "openrelayproject",
-				Credential: "openrelayproject",
+				URLs:       []string{"turn:freestun.net:3479"},
+				Username:   "free",
+				Credential: "free",
+			},
+			{
+				URLs:       []string{"turns:freestun.net:5350"},
+				Username:   "free",
+				Credential: "free",
 			},
 		},
 	}
