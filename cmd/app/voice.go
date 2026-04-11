@@ -39,10 +39,14 @@ type VoiceClient struct {
 	outputStream  *portaudio.Stream                // current output stream (owned by playAudio)
 	outputGen     uint32                           // atomic; increment to tell playAudio to reopen output
 	micTracks     []*webrtc.TrackLocalStaticSample // active mic tracks for RestartAudio
-	
+
 	// AGC (Automatic Gain Control)
 	agcTargetLevel float32 // target RMS level (0.1 to 0.5 typically)
 	agcCurrentGain float32 // current gain multiplier
+
+	// ICE candidate buffering (for race condition fix)
+	iceCandidateQueues map[string][]*webrtc.ICECandidateInit // nick → queued candidates
+	iceQueueMu         sync.Mutex
 }
 
 type SignalMsg struct {
@@ -61,10 +65,11 @@ func ListAudioDevices() ([]*portaudio.DeviceInfo, error) {
 
 func NewVoiceClient(myNick string) *VoiceClient {
 	return &VoiceClient{
-		myNick:         myNick,
-		pc:             make(map[string]*webrtc.PeerConnection),
-		agcTargetLevel: 6500,  // target RMS - mid-range for better balance
-		agcCurrentGain: 1.0,   // start with unity gain
+		myNick:             myNick,
+		pc:                 make(map[string]*webrtc.PeerConnection),
+		agcTargetLevel:     5000, // target RMS in int16 scale (lowered to prevent echo amplification)
+		agcCurrentGain:     1.0,  // start with unity gain
+		iceCandidateQueues: make(map[string][]*webrtc.ICECandidateInit),
 	}
 }
 
@@ -464,6 +469,18 @@ func (vc *VoiceClient) handleOffer(fromNick, payload string) {
 		return
 	}
 
+	// Flush any queued ICE candidates now that remote description is set
+	vc.iceQueueMu.Lock()
+	queuedCandidates := vc.iceCandidateQueues[fromNick]
+	delete(vc.iceCandidateQueues, fromNick)
+	vc.iceQueueMu.Unlock()
+
+	for _, candidate := range queuedCandidates {
+		if err := pc.AddICECandidate(*candidate); err != nil {
+			fmt.Printf("VOICE: handleOffer - AddICECandidate (queued) error: %v\n", err)
+		}
+	}
+
 	answer, err3 := pc.CreateAnswer(nil)
 	if err3 != nil {
 		fmt.Printf("VOICE: handleOffer - CreateAnswer error: %v\n", err3)
@@ -501,6 +518,19 @@ func (vc *VoiceClient) handleAnswer(fromNick, payload string) {
 	err = pc.SetRemoteDescription(answer)
 	if err != nil {
 		fmt.Printf("VOICE: handleAnswer - SetRemoteDescription error: %v\n", err)
+		return
+	}
+
+	// Flush any queued ICE candidates now that remote description is set
+	vc.iceQueueMu.Lock()
+	queuedCandidates := vc.iceCandidateQueues[fromNick]
+	delete(vc.iceCandidateQueues, fromNick)
+	vc.iceQueueMu.Unlock()
+
+	for _, candidate := range queuedCandidates {
+		if err := pc.AddICECandidate(*candidate); err != nil {
+			fmt.Printf("VOICE: handleAnswer - AddICECandidate (queued) error: %v\n", err)
+		}
 	}
 }
 
@@ -517,8 +547,18 @@ func (vc *VoiceClient) handleICE(fromNick, payload string) {
 		fmt.Printf("VOICE: handleICE - unmarshal error: %v\n", err)
 		return
 	}
+
+	// Try to add ICE candidate
 	err = pc.AddICECandidate(candidate)
 	if err != nil {
+		// If it fails with InvalidStateError, queue it for later
+		if err.Error() == "InvalidStateError: remote description is not set" {
+			vc.iceQueueMu.Lock()
+			vc.iceCandidateQueues[fromNick] = append(vc.iceCandidateQueues[fromNick], &candidate)
+			vc.iceQueueMu.Unlock()
+			fmt.Printf("VOICE: handleICE - queued candidate from %s (remote description not set yet)\n", fromNick)
+			return
+		}
 		fmt.Printf("VOICE: handleICE - AddICECandidate error: %v\n", err)
 	}
 }
@@ -538,29 +578,31 @@ func calculateRMS(buf []float32) float32 {
 
 // applyAGC normalizes audio gain to target RMS level
 // Works with int16-scale float32 audio (values typically 0-32768 range)
-// Applies exponential smoothing to prevent sudden level jumps
+// Applies exponential smoothing to prevent sudden level jumps and reduce echo
 // targetRMS: desired RMS level in int16 scale
 func (vc *VoiceClient) applyAGC(buf []float32, targetRMS float32) {
-	const smoothingFactor = 0.15
-	
+	const smoothingFactor = 0.1 // even slower response time
+
 	rms := calculateRMS(buf)
-	
-	if rms < 100 { // silence threshold
+
+	// Always apply some normalization, even on quiet frames
+	// Avoid division by zero on complete silence
+	if rms < 1.0 {
 		return
 	}
 
 	// Calculate desired gain to reach target RMS
 	desiredGain := targetRMS / rms
 
-	// Clamp gain: allow 0.2x to 10.0x (wider range for more flexibility)
-	// This helps quiet speakers be heard and loud speakers not blast
-	if desiredGain > 10.0 {
-		desiredGain = 10.0  // up to +20dB for quiet audio
-	} else if desiredGain < 0.2 {
-		desiredGain = 0.2   // down to -14dB for loud audio
+	// Clamp gain: allow 0.7x to 2.5x (very conservative)
+	// This just smooths out volume variations, not aggressive normalization
+	if desiredGain > 2.5 {
+		desiredGain = 2.5 // up to +8dB
+	} else if desiredGain < 0.7 {
+		desiredGain = 0.7 // down to -3dB
 	}
 
-	// Apply exponential smoothing
+	// Apply exponential smoothing - very gradual
 	vc.agcCurrentGain = (1.0-smoothingFactor)*vc.agcCurrentGain + smoothingFactor*desiredGain
 
 	// Apply gain with clipping prevention
@@ -659,8 +701,7 @@ func (vc *VoiceClient) captureMic(track *webrtc.TrackLocalStaticSample) {
 		// apply noise suppression
 		vad := denoiser.Process(floatBuf)
 
-		// apply automatic gain control (AGC) to normalize audio level
-		// This ensures consistent volume regardless of microphone sensitivity
+		// apply automatic gain control (AGC) to normalize audio level smoothly
 		vc.applyAGC(floatBuf, vc.agcTargetLevel)
 
 		// convert back float32 → int16
@@ -668,8 +709,8 @@ func (vc *VoiceClient) captureMic(track *webrtc.TrackLocalStaticSample) {
 			buf[i] = int16(f)
 		}
 
-		// VAD: more aggressive threshold (0.25) to filter out background noise
-		isVoice := vad > 0.25
+		// VAD: threshold (0.35) to filter out echo and background noise without cutting speech
+		isVoice := vad > 0.35
 
 		if isVoice != lastSpeakingStatus && time.Since(lastStatusTime) > 200*time.Millisecond {
 			lastSpeakingStatus = isVoice
