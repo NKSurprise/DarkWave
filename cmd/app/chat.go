@@ -316,6 +316,12 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 			currentDMKey = nil
 			members = []string{}
 			membersList.Refresh()
+			
+			// Clear all voice channels (we'll fetch new ones for current room only)
+			for i := range roomsWithVoice {
+				roomsWithVoice[i].voiceChannels = nil
+			}
+			
 			conn.send("/join " + r.name)
 			conn.send("/voicechannels")
 			conn.send("/rooms") // Refresh rooms list after joining
@@ -453,6 +459,12 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 					raw := strings.TrimPrefix(msg, "** rooms: ")
 					if raw != "(none)" {
 						allRooms := strings.Split(raw, ", ")
+						// Deduplicate rooms
+						seen := make(map[string]bool)
+						oldRooms := make(map[string][]string) // preserve existing voice channels
+						for _, r := range roomsWithVoice {
+							oldRooms[r.name] = r.voiceChannels
+						}
 						roomsWithVoice = []RoomWithVoice{}
 						for _, r := range allRooms {
 							// DMs are handled separately
@@ -461,7 +473,16 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 							}
 							// Remove leading # for storage (display logic adds it back)
 							displayName := strings.TrimPrefix(r, "#")
-							roomsWithVoice = append(roomsWithVoice, RoomWithVoice{name: displayName})
+							// Skip duplicates
+							if !seen[displayName] {
+								newRoom := RoomWithVoice{name: displayName}
+								// Preserve existing voice channels if the room already existed
+								if existingChannels, ok := oldRooms[displayName]; ok {
+									newRoom.voiceChannels = existingChannels
+								}
+								roomsWithVoice = append(roomsWithVoice, newRoom)
+								seen[displayName] = true
+							}
 						}
 						roomsList.Refresh()
 					}
