@@ -36,13 +36,20 @@ type VoiceClient struct {
 	onMemberJoin  func(nick string)
 	onMemberLeave func(nick string)
 	audioMu       sync.Mutex                       // protects stream, outputStream
-	outputStream  *portaudio.Stream                // current output stream (owned by playAudio)
-	outputGen     uint32                           // atomic; increment to tell playAudio to reopen output
+	outputStream  *portaudio.Stream                // central output stream (owned by playbackManager)
+	outputGen     uint32                           // atomic; increment to tell playbackManager to reopen output
 	micTracks     []*webrtc.TrackLocalStaticSample // active mic tracks for RestartAudio
-	
+
+	// Audio playback management
+	audioQueue chan []int16 // queue of audio samples from all peers
+
 	// AGC (Automatic Gain Control)
 	agcTargetLevel float32 // target RMS level (0.1 to 0.5 typically)
 	agcCurrentGain float32 // current gain multiplier
+
+	// ICE candidate buffering (for race condition fix)
+	iceCandidateQueues map[string][]*webrtc.ICECandidateInit // nick → queued candidates
+	iceQueueMu         sync.Mutex
 }
 
 type SignalMsg struct {
@@ -61,10 +68,12 @@ func ListAudioDevices() ([]*portaudio.DeviceInfo, error) {
 
 func NewVoiceClient(myNick string) *VoiceClient {
 	return &VoiceClient{
-		myNick:         myNick,
-		pc:             make(map[string]*webrtc.PeerConnection),
-		agcTargetLevel: 6500,  // target RMS - mid-range for better balance
-		agcCurrentGain: 1.0,   // start with unity gain
+		myNick:             myNick,
+		pc:                 make(map[string]*webrtc.PeerConnection),
+		agcTargetLevel:     5000, // target RMS in int16 scale (lowered to prevent echo amplification)
+		agcCurrentGain:     1.0,  // start with unity gain
+		iceCandidateQueues: make(map[string][]*webrtc.ICECandidateInit),
+		audioQueue:         make(chan []int16, 10), // buffered channel for peer audio
 	}
 }
 
@@ -88,6 +97,9 @@ func (vc *VoiceClient) JoinChannel(wsAddr, channel string) error {
 	vc.channel = channel
 	vc.isConnected = true
 
+	// start playback manager to handle audio from all peers
+	go vc.playbackManager()
+
 	// send join message
 	vc.send(SignalMsg{
 		Type:    "join",
@@ -99,6 +111,109 @@ func (vc *VoiceClient) JoinChannel(wsAddr, channel string) error {
 	go vc.readLoop()
 
 	return nil
+}
+
+// playbackManager owns the single output stream for the entire session
+// All peer audio is sent to this manager via the audioQueue channel
+func (vc *VoiceClient) playbackManager() {
+	fmt.Println("VOICE: playbackManager started")
+	sampleRate := 48000
+	channels := 1
+	framesPerBuffer := 960
+	buf := make([]int16, framesPerBuffer)
+
+	// Open output stream once for the entire session
+	vc.audioMu.Lock()
+	if vc.outputStream != nil {
+		vc.outputStream.Stop()
+		vc.outputStream.Close()
+	}
+
+	var s *portaudio.Stream
+	var err error
+	if vc.outputDevice != nil {
+		fmt.Printf("VOICE: playbackManager - opening device: %v\n", vc.outputDevice.Name)
+		params := portaudio.StreamParameters{
+			Output: portaudio.StreamDeviceParameters{
+				Device:   vc.outputDevice,
+				Channels: channels,
+				Latency:  vc.outputDevice.DefaultLowOutputLatency,
+			},
+			SampleRate:      float64(sampleRate),
+			FramesPerBuffer: framesPerBuffer,
+		}
+		s, err = portaudio.OpenStream(params, buf)
+	} else {
+		s, err = portaudio.OpenDefaultStream(0, channels, float64(sampleRate), framesPerBuffer, buf)
+	}
+	if err != nil {
+		fmt.Printf("VOICE: playbackManager - stream open failed: %v\n", err)
+		vc.audioMu.Unlock()
+		return
+	}
+	s.Start()
+	vc.outputStream = s
+	fmt.Println("VOICE: playbackManager - stream ready")
+	vc.audioMu.Unlock()
+
+	// Cleanup when disconnecting
+	defer func() {
+		vc.audioMu.Lock()
+		if vc.outputStream == s {
+			s.Stop()
+			s.Close()
+			vc.outputStream = nil
+		}
+		vc.audioMu.Unlock()
+	}()
+
+	// Loop: receive audio from all peers and write to output stream
+	for vc.isConnected {
+		select {
+		case audioData, ok := <-vc.audioQueue:
+			if !ok {
+				return
+			}
+			// Copy audio data to buffer
+			if len(audioData) > len(buf) {
+				fmt.Printf("VOICE: playbackManager - audio chunk larger than buffer (%d > %d)\n", len(audioData), len(buf))
+				continue
+			}
+			copy(buf, audioData)
+
+			// Write to output stream
+			if err := s.Write(); err != nil {
+				fmt.Printf("VOICE: playbackManager - write error: %v\n", err)
+				// Try to reopen stream
+				vc.audioMu.Lock()
+				s.Stop()
+				s.Close()
+
+				if vc.outputDevice != nil {
+					params := portaudio.StreamParameters{
+						Output: portaudio.StreamDeviceParameters{
+							Device:   vc.outputDevice,
+							Channels: channels,
+							Latency:  vc.outputDevice.DefaultLowOutputLatency,
+						},
+						SampleRate:      float64(sampleRate),
+						FramesPerBuffer: framesPerBuffer,
+					}
+					s, err = portaudio.OpenStream(params, buf)
+				} else {
+					s, err = portaudio.OpenDefaultStream(0, channels, float64(sampleRate), framesPerBuffer, buf)
+				}
+				if err == nil {
+					s.Start()
+					vc.outputStream = s
+				}
+				vc.audioMu.Unlock()
+			}
+		default:
+			// No audio available, skip this iteration to avoid busy waiting
+			time.Sleep(1 * time.Millisecond)
+		}
+	}
 }
 
 func (vc *VoiceClient) LeaveChannel() {
@@ -464,6 +579,18 @@ func (vc *VoiceClient) handleOffer(fromNick, payload string) {
 		return
 	}
 
+	// Flush any queued ICE candidates now that remote description is set
+	vc.iceQueueMu.Lock()
+	queuedCandidates := vc.iceCandidateQueues[fromNick]
+	delete(vc.iceCandidateQueues, fromNick)
+	vc.iceQueueMu.Unlock()
+
+	for _, candidate := range queuedCandidates {
+		if err := pc.AddICECandidate(*candidate); err != nil {
+			fmt.Printf("VOICE: handleOffer - AddICECandidate (queued) error: %v\n", err)
+		}
+	}
+
 	answer, err3 := pc.CreateAnswer(nil)
 	if err3 != nil {
 		fmt.Printf("VOICE: handleOffer - CreateAnswer error: %v\n", err3)
@@ -501,6 +628,19 @@ func (vc *VoiceClient) handleAnswer(fromNick, payload string) {
 	err = pc.SetRemoteDescription(answer)
 	if err != nil {
 		fmt.Printf("VOICE: handleAnswer - SetRemoteDescription error: %v\n", err)
+		return
+	}
+
+	// Flush any queued ICE candidates now that remote description is set
+	vc.iceQueueMu.Lock()
+	queuedCandidates := vc.iceCandidateQueues[fromNick]
+	delete(vc.iceCandidateQueues, fromNick)
+	vc.iceQueueMu.Unlock()
+
+	for _, candidate := range queuedCandidates {
+		if err := pc.AddICECandidate(*candidate); err != nil {
+			fmt.Printf("VOICE: handleAnswer - AddICECandidate (queued) error: %v\n", err)
+		}
 	}
 }
 
@@ -517,8 +657,18 @@ func (vc *VoiceClient) handleICE(fromNick, payload string) {
 		fmt.Printf("VOICE: handleICE - unmarshal error: %v\n", err)
 		return
 	}
+
+	// Try to add ICE candidate
 	err = pc.AddICECandidate(candidate)
 	if err != nil {
+		// If it fails with InvalidStateError, queue it for later
+		if err.Error() == "InvalidStateError: remote description is not set" {
+			vc.iceQueueMu.Lock()
+			vc.iceCandidateQueues[fromNick] = append(vc.iceCandidateQueues[fromNick], &candidate)
+			vc.iceQueueMu.Unlock()
+			fmt.Printf("VOICE: handleICE - queued candidate from %s (remote description not set yet)\n", fromNick)
+			return
+		}
 		fmt.Printf("VOICE: handleICE - AddICECandidate error: %v\n", err)
 	}
 }
@@ -538,29 +688,31 @@ func calculateRMS(buf []float32) float32 {
 
 // applyAGC normalizes audio gain to target RMS level
 // Works with int16-scale float32 audio (values typically 0-32768 range)
-// Applies exponential smoothing to prevent sudden level jumps
+// Applies exponential smoothing to prevent sudden level jumps and reduce echo
 // targetRMS: desired RMS level in int16 scale
 func (vc *VoiceClient) applyAGC(buf []float32, targetRMS float32) {
-	const smoothingFactor = 0.15
-	
+	const smoothingFactor = 0.1 // even slower response time
+
 	rms := calculateRMS(buf)
-	
-	if rms < 100 { // silence threshold
+
+	// Always apply some normalization, even on quiet frames
+	// Avoid division by zero on complete silence
+	if rms < 1.0 {
 		return
 	}
 
 	// Calculate desired gain to reach target RMS
 	desiredGain := targetRMS / rms
 
-	// Clamp gain: allow 0.2x to 10.0x (wider range for more flexibility)
-	// This helps quiet speakers be heard and loud speakers not blast
-	if desiredGain > 10.0 {
-		desiredGain = 10.0  // up to +20dB for quiet audio
-	} else if desiredGain < 0.2 {
-		desiredGain = 0.2   // down to -14dB for loud audio
+	// Clamp gain: allow 0.7x to 2.5x (very conservative)
+	// This just smooths out volume variations, not aggressive normalization
+	if desiredGain > 2.5 {
+		desiredGain = 2.5 // up to +8dB
+	} else if desiredGain < 0.7 {
+		desiredGain = 0.7 // down to -3dB
 	}
 
-	// Apply exponential smoothing
+	// Apply exponential smoothing - very gradual
 	vc.agcCurrentGain = (1.0-smoothingFactor)*vc.agcCurrentGain + smoothingFactor*desiredGain
 
 	// Apply gain with clipping prevention
@@ -659,8 +811,7 @@ func (vc *VoiceClient) captureMic(track *webrtc.TrackLocalStaticSample) {
 		// apply noise suppression
 		vad := denoiser.Process(floatBuf)
 
-		// apply automatic gain control (AGC) to normalize audio level
-		// This ensures consistent volume regardless of microphone sensitivity
+		// apply automatic gain control (AGC) to normalize audio level smoothly
 		vc.applyAGC(floatBuf, vc.agcTargetLevel)
 
 		// convert back float32 → int16
@@ -668,8 +819,8 @@ func (vc *VoiceClient) captureMic(track *webrtc.TrackLocalStaticSample) {
 			buf[i] = int16(f)
 		}
 
-		// VAD: more aggressive threshold (0.25) to filter out background noise
-		isVoice := vad > 0.25
+		// VAD: higher threshold (0.35) to filter out echo and background noise
+		isVoice := vad > 0.7
 
 		if isVoice != lastSpeakingStatus && time.Since(lastStatusTime) > 200*time.Millisecond {
 			lastSpeakingStatus = isVoice
@@ -727,69 +878,13 @@ func (vc *VoiceClient) playAudio(track *webrtc.TrackRemote) {
 	framesPerBuffer := 960
 	buf := make([]int16, framesPerBuffer)
 
-	// openStream closes any previous output stream and opens a fresh one.
-	// Must be called only from the playAudio goroutine.
-	openStream := func() *portaudio.Stream {
-		vc.audioMu.Lock()
-		defer vc.audioMu.Unlock()
-		if vc.outputStream != nil {
-			vc.outputStream.Stop()
-			vc.outputStream.Close()
-			vc.outputStream = nil
-		}
-		var s *portaudio.Stream
-		var err error
-		if vc.outputDevice != nil {
-			fmt.Printf("VOICE: playAudio - opening device: %v\n", vc.outputDevice.Name)
-			params := portaudio.StreamParameters{
-				Output: portaudio.StreamDeviceParameters{
-					Device:   vc.outputDevice,
-					Channels: channels,
-					Latency:  vc.outputDevice.DefaultLowOutputLatency,
-				},
-				SampleRate:      float64(sampleRate),
-				FramesPerBuffer: framesPerBuffer,
-			}
-			s, err = portaudio.OpenStream(params, buf)
-		} else {
-			s, err = portaudio.OpenDefaultStream(0, channels, float64(sampleRate), framesPerBuffer, buf)
-		}
-		if err != nil {
-			fmt.Printf("VOICE: playAudio - stream open failed: %v\n", err)
-			return nil
-		}
-		s.Start()
-		vc.outputStream = s
-		fmt.Println("VOICE: playAudio - stream ready")
-		return s
-	}
-
-	stream := openStream()
-	if stream == nil {
-		return
-	}
-	// Cleanup when this goroutine exits (e.g. RTP error on disconnect).
-	// LeaveChannel may have already closed it; the pointer check makes it safe.
-	defer func() {
-		vc.audioMu.Lock()
-		if vc.outputStream == stream {
-			stream.Stop()
-			stream.Close()
-			vc.outputStream = nil
-		}
-		vc.audioMu.Unlock()
-	}()
-
 	dec, err := opus.NewDecoder(sampleRate, channels)
 	if err != nil {
 		fmt.Println("voice: opus decoder error:", err)
 		return
 	}
 
-	// Track the generation we were opened at. RestartAudio increments outputGen
-	// to request a device switch. We check after each Write() — no concurrent close.
-	myGen := atomic.LoadUint32(&vc.outputGen)
-
+	// Read RTP packets, decode, and send to playbackManager queue
 	for vc.isConnected {
 		pkt, _, err := track.ReadRTP()
 		if err != nil {
@@ -802,23 +897,18 @@ func (vc *VoiceClient) playAudio(track *webrtc.TrackRemote) {
 			continue
 		}
 
-		// Write to the current stream. No lock held — write is blocking (~20ms)
-		// and RestartAudio never touches vc.outputStream, so there is no race.
-		if err := stream.Write(); err != nil {
-			fmt.Println("voice: write error, reopening:", err)
-			// Treat a write error the same as a device switch request.
-			atomic.AddUint32(&vc.outputGen, 1)
-		}
+		// Copy the decoded audio before sending to avoid buffer reuse issues
+		audioCopy := make([]int16, len(buf))
+		copy(audioCopy, buf)
 
-		// After each write, check if a device switch was requested.
-		curGen := atomic.LoadUint32(&vc.outputGen)
-		if curGen != myGen {
-			myGen = curGen
-			newStream := openStream()
-			if newStream == nil {
-				return
-			}
-			stream = newStream
+		// Send decoded audio to playback manager
+		// Non-blocking send to avoid deadlock if queue is full
+		select {
+		case vc.audioQueue <- audioCopy:
+			// Sent successfully
+		default:
+			// Queue full, drop frame to maintain responsiveness
+			fmt.Println("VOICE: audio queue full, dropping frame")
 		}
 	}
 }
