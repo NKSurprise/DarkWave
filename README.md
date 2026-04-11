@@ -1,72 +1,73 @@
 # DarkWave 🌊
 
-A lightweight, native desktop chat app built in Go. Real-time messaging, encrypted DMs, voice channels, and room management — without the bloat of Electron.
+A lightweight native desktop chat app built in Go. Real-time messaging, encrypted DMs, peer-to-peer voice channels, and room management — without the bloat of Electron.
+
+![DarkWave](Images/gemini-2.png)
 
 ---
 
-## What it does
+## Features
 
-- Real-time messaging over TCP
-- Multiple chat rooms — join, leave, create
-- Voice channels per room with peer-to-peer audio (WebRTC)
-- Noise suppression (RNNoise) and voice activity detection
-- Speaking indicators — see who's talking in real time
-- Audio device selection (microphone and speaker)
-- Friends system with real-time online/offline status
-- Encrypted direct messages (AES-GCM, end-to-end)
-- Password-protected accounts with Argon2 hashing
-- Room member tracking
-- Message persistence via PostgreSQL
-- Native desktop UI built with Fyne (Windows, Mac, Linux)
-- Accent color theming — red, blue, green, or purple
-- Single-session enforcement
+- 💬 Real-time text messaging with room support
+- 🔊 Voice channels with peer-to-peer audio (WebRTC)
+- 🔇 Noise suppression (RNNoise) and voice activity detection
+- 🟢 Speaking indicators — see who's talking in real time
+- 🔐 Encrypted DMs — AES-256-GCM end-to-end, server never sees content
+- 👥 Friend system with real-time online/offline status
+- 🏠 Room member tracking
+- 🎨 Custom accent color themes (Red, Blue, Green, Purple)
+- 💾 Message persistence via PostgreSQL
+- 🪶 Native desktop UI — ~50MB RAM vs Discord's 500MB+
 
 ---
 
-## Project structure
+## Download
 
-```
-DarkWave/
-├── main.go        — entry point
-├── server.go      — server lifecycle
-├── client.go      — client connection handling
-├── room.go        — room management and broadcasting
-├── commands.go    — command parsing
-├── dispatch.go    — message routing
-├── signal.go      — WebRTC signalling server (WebSocket :3001)
-├── models.go      — structs
-├── db.go          — database connection
-├── store.go       — database queries
-├── crypto.go      — Argon2 password hashing
-└── cmd/
-    ├── client/    — legacy terminal client
-    └── app/       — native desktop client (Fyne)
-        ├── main.go     — login screen, theme picker
-        ├── chat.go     — main chat UI
-        ├── voice.go    — WebRTC voice client
-        ├── rnnoise.go  — noise suppression
-        ├── settings.go — audio device settings
-        ├── net.go      — TCP connection
-        ├── crypto.go   — AES-GCM DM encryption
-        └── theme.go    — custom theme
-```
+Download the latest build from the [Actions tab](https://github.com/NKSurprise/DarkWave/actions) → latest successful run → Artifacts.
+
+| Platform | File |
+|---|---|
+| Windows | `DarkWave-windows.zip` — extract and run `DarkWave.exe` |
+| Linux | `DarkWave-linux` — make executable and run |
+| Mac | `DarkWave-mac` — make executable and run |
 
 ---
 
-## Getting started
+## Connecting
+
+On the login screen enter:
+- **Server address** — provided by your host (e.g. `85.130.x.x:3000`)
+- **Nickname** — your username
+- **Password** — created on first login
+
+---
+
+## Self-hosting
 
 ### Prerequisites
 
 - Go 1.21+
-- PostgreSQL (or Supabase)
-- GCC — required by Fyne
-  - **Windows**: install via [MSYS2](https://www.msys2.org/) UCRT64, then:
+- PostgreSQL
+- GCC (for CGO)
+  - **Windows**: [MSYS2](https://www.msys2.org/) UCRT64
     ```bash
-    pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-portaudio mingw-w64-ucrt-x86_64-opus mingw-w64-ucrt-x86_64-opusfile mingw-w64-ucrt-x86_64-rnnoise
+    pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-portaudio mingw-w64-ucrt-x86_64-opus mingw-w64-ucrt-x86_64-opusfile mingw-w64-ucrt-x86_64-rnnoise mingw-w64-ucrt-x86_64-pkg-config
     ```
-  - **Linux/Mac**: install via your package manager
+  - **Linux (Ubuntu)**:
+    ```bash
+    sudo apt-get install gcc libportaudio2 portaudio19-dev libopus-dev libopusfile-dev pkg-config libgl1-mesa-dev
+    # rnnoise from source:
+    git clone https://github.com/xiph/rnnoise.git
+    cd rnnoise && ./autogen.sh && ./configure && make && sudo make install
+    ```
+  - **Mac**:
+    ```bash
+    brew install portaudio opus opusfile pkg-config
+    git clone https://github.com/xiph/rnnoise.git
+    cd rnnoise && ./autogen.sh && ./configure && make && sudo make install
+    ```
 
-### Server setup
+### Setup
 
 1. Create a PostgreSQL database:
    ```bash
@@ -85,20 +86,12 @@ DarkWave/
    go run .
    ```
 
-### Client setup
+4. Run the client (MSYS2 UCRT64 on Windows):
+   ```bash
+   go run ./cmd/app/
+   ```
 
-**Windows (MSYS2 UCRT64 terminal):**
-```bash
-cd /d/git/DarkWave
-go run ./cmd/app/
-```
-
-**Linux/Mac:**
-```bash
-go run ./cmd/app/
-```
-
-On the login screen enter the server address, your nickname and password.
+Port forward `:3000` and `:3001` on your router so friends can connect from outside your network.
 
 ---
 
@@ -106,46 +99,33 @@ On the login screen enter the server address, your nickname and password.
 
 | Command | Description |
 |---|---|
-| `/nick <n>` | Set nickname and log in |
+| `/nick <name>` | Set nickname and log in |
 | `/join <room>` | Join or create a room |
 | `/leave` | Leave current room |
-| `/dm <nick>` | Open encrypted DM |
+| `/dm <nick>` | Open encrypted DM with a friend |
 | `/createvoice <name>` | Create a voice channel (room creator only) |
-| `/voicechannels` | List voice channels in current room |
 | `/rooms` | List your rooms |
 | `/friends` | List friends |
-| `/addfriend <nick>` | Send friend request |
+| `/addfriend <nick>` | Send a friend request |
 | `/friendreqs` | View pending requests |
-| `/acceptfriend <nick>` | Accept friend request |
-| `/declinefriend <nick>` | Decline friend request |
-| `/help` or `/?` | Show help |
+| `/acceptfriend <nick>` | Accept a friend request |
+| `/declinefriend <nick>` | Decline a friend request |
+| `/help` | Show help |
 | `/quit` | Disconnect |
-
----
-
-## Voice channels
-
-Voice channels appear under each text room in the sidebar. Click a voice channel to join — audio is peer-to-peer via WebRTC, the server only handles signalling.
-
-Features:
-- Noise suppression via RNNoise
-- Voice activity detection (only transmits when speaking)
-- Speaking indicators in the voice panel
-- Microphone and speaker device selection via Audio settings
 
 ---
 
 ## How DM encryption works
 
-Messages are encrypted client-side with AES-256-GCM. The server only ever sees ciphertext.
+Messages are encrypted client-side. The server only ever sees ciphertext and cannot read DM content.
 
 ```
 alice types "hey"
-→ key = SHA256("alice:bob")   (sorted, same for both sides)
-→ encrypt with AES-GCM
+→ key = SHA256("alice:bob")   ← sorted alphabetically, same for both sides
+→ encrypt with AES-256-GCM
 → send ciphertext to server
 → server forwards to bob
-→ bob derives same key
+→ bob derives same key independently
 → decrypt → "hey"
 ```
 
@@ -160,11 +140,14 @@ alice types "hey"
 - [x] Message persistence
 - [x] Room member tracking
 - [x] Native desktop UI (Fyne)
-- [x] Encrypted DMs (AES-GCM)
+- [x] Encrypted DMs (AES-256-GCM)
 - [x] Custom accent color theming
 - [x] Voice channels (WebRTC peer-to-peer)
-- [x] Noise suppression (RNNoise)
+- [x] Noise suppression (RNNoise) + VAD
 - [x] Speaking indicators
+- [x] Audio device selection
+- [x] Server address on login screen
+- [x] GitHub Actions CI builds (Windows, Linux, Mac)
 - [ ] End-to-end encryption for rooms
 - [ ] Screen sharing (1080p60, hardware encoding)
 
@@ -172,17 +155,17 @@ alice types "hey"
 
 ## Tech stack
 
-- **Go** — server and client
-- **Fyne** — native desktop UI
-- **Pion WebRTC** — peer-to-peer voice
-- **PortAudio** — microphone and speaker
-- **Opus** — audio codec
-- **RNNoise** — noise suppression
-- **PostgreSQL** — persistence
-- **pgx** — PostgreSQL driver
-- **Argon2** — password hashing
-- **AES-GCM** — DM encryption
-- **gorilla/websocket** — WebRTC signalling
+| | |
+|---|---|
+| Language | Go |
+| UI | Fyne |
+| Voice | Pion WebRTC |
+| Audio | PortAudio + Opus |
+| Noise suppression | RNNoise |
+| Database | PostgreSQL + pgx |
+| Password hashing | Argon2 |
+| DM encryption | AES-256-GCM |
+| Signalling | gorilla/websocket |
 
 ---
 
