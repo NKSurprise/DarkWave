@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,6 +39,10 @@ type VoiceClient struct {
 	outputStream  *portaudio.Stream                // current output stream (owned by playAudio)
 	outputGen     uint32                           // atomic; increment to tell playAudio to reopen output
 	micTracks     []*webrtc.TrackLocalStaticSample // active mic tracks for RestartAudio
+	
+	// AGC (Automatic Gain Control)
+	agcTargetLevel float32 // target RMS level (0.1 to 0.5 typically)
+	agcCurrentGain float32 // current gain multiplier
 }
 
 type SignalMsg struct {
@@ -56,8 +61,10 @@ func ListAudioDevices() ([]*portaudio.DeviceInfo, error) {
 
 func NewVoiceClient(myNick string) *VoiceClient {
 	return &VoiceClient{
-		myNick: myNick,
-		pc:     make(map[string]*webrtc.PeerConnection),
+		myNick:         myNick,
+		pc:             make(map[string]*webrtc.PeerConnection),
+		agcTargetLevel: 6500,  // target RMS - mid-range for better balance
+		agcCurrentGain: 1.0,   // start with unity gain
 	}
 }
 
@@ -516,6 +523,57 @@ func (vc *VoiceClient) handleICE(fromNick, payload string) {
 	}
 }
 
+// calculateRMS computes root mean square level of audio samples
+// For int16-scale float32 audio, returns values typically in 0-32768 range
+func calculateRMS(buf []float32) float32 {
+	if len(buf) == 0 {
+		return 0
+	}
+	var sum float32
+	for _, s := range buf {
+		sum += s * s
+	}
+	return float32(math.Sqrt(float64(sum / float32(len(buf)))))
+}
+
+// applyAGC normalizes audio gain to target RMS level
+// Works with int16-scale float32 audio (values typically 0-32768 range)
+// Applies exponential smoothing to prevent sudden level jumps
+// targetRMS: desired RMS level in int16 scale
+func (vc *VoiceClient) applyAGC(buf []float32, targetRMS float32) {
+	const smoothingFactor = 0.15
+	
+	rms := calculateRMS(buf)
+	
+	if rms < 100 { // silence threshold
+		return
+	}
+
+	// Calculate desired gain to reach target RMS
+	desiredGain := targetRMS / rms
+
+	// Clamp gain: allow 0.2x to 10.0x (wider range for more flexibility)
+	// This helps quiet speakers be heard and loud speakers not blast
+	if desiredGain > 10.0 {
+		desiredGain = 10.0  // up to +20dB for quiet audio
+	} else if desiredGain < 0.2 {
+		desiredGain = 0.2   // down to -14dB for loud audio
+	}
+
+	// Apply exponential smoothing
+	vc.agcCurrentGain = (1.0-smoothingFactor)*vc.agcCurrentGain + smoothingFactor*desiredGain
+
+	// Apply gain with clipping prevention
+	for i := range buf {
+		buf[i] *= vc.agcCurrentGain
+		if buf[i] > 32767 {
+			buf[i] = 32767
+		} else if buf[i] < -32768 {
+			buf[i] = -32768
+		}
+	}
+}
+
 func (vc *VoiceClient) captureMic(track *webrtc.TrackLocalStaticSample) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -601,12 +659,17 @@ func (vc *VoiceClient) captureMic(track *webrtc.TrackLocalStaticSample) {
 		// apply noise suppression
 		vad := denoiser.Process(floatBuf)
 
+		// apply automatic gain control (AGC) to normalize audio level
+		// This ensures consistent volume regardless of microphone sensitivity
+		vc.applyAGC(floatBuf, vc.agcTargetLevel)
+
 		// convert back float32 → int16
 		for i, f := range floatBuf {
 			buf[i] = int16(f)
 		}
 
-		isVoice := vad > 0.4
+		// VAD: more aggressive threshold (0.25) to filter out background noise
+		isVoice := vad > 0.25
 
 		if isVoice != lastSpeakingStatus && time.Since(lastStatusTime) > 200*time.Millisecond {
 			lastSpeakingStatus = isVoice

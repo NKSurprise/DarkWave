@@ -268,7 +268,7 @@ func (r *Repo) removeUserFromRoom(ctx context.Context, userID, roomID int64) err
 
 func (r *Repo) getUserRooms(ctx context.Context, userID int64) ([]string, error) {
 	rows, err := r.pool.Query(ctx, `
-        select ro.name from rooms ro
+        select distinct ro.name from rooms ro
         join room_members rm on rm.room_id = ro.id
         where rm.user_id = $1
         order by ro.name
@@ -278,6 +278,7 @@ func (r *Repo) getUserRooms(ctx context.Context, userID int64) ([]string, error)
 		return nil, err
 	}
 	defer rows.Close()
+	seen := make(map[string]bool)
 	var names []string
 	for rows.Next() {
 		var name string
@@ -286,7 +287,11 @@ func (r *Repo) getUserRooms(ctx context.Context, userID int64) ([]string, error)
 		if !strings.HasPrefix(name, "dm:") && !strings.HasPrefix(name, "#") {
 			name = "#" + name
 		}
-		names = append(names, name)
+		// Skip duplicates (belt-and-suspenders deduplication)
+		if !seen[name] {
+			names = append(names, name)
+			seen[name] = true
+		}
 	}
 	fmt.Printf("✓ getUserRooms: userID=%d, found %d rooms: %v\n", userID, len(names), names)
 	return names, nil
