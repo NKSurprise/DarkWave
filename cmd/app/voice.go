@@ -49,6 +49,10 @@ type VoiceClient struct {
 	// ICE candidate buffering (for race condition fix)
 	iceCandidateQueues map[string][]*webrtc.ICECandidateInit // nick → queued candidates
 	iceQueueMu         sync.Mutex
+
+	// Per-peer volume adjustment (1.0 = 100%, range 0.0-2.0)
+	peerVolumes map[string]float32 // nick → volume multiplier
+	volumeMu    sync.Mutex
 }
 
 type SignalMsg struct {
@@ -72,12 +76,17 @@ func NewVoiceClient(myNick string) *VoiceClient {
 		agcTargetLevel:     5000, // target RMS in int16 scale (lowered to prevent echo amplification)
 		agcCurrentGain:     1.0,  // start with unity gain
 		iceCandidateQueues: make(map[string][]*webrtc.ICECandidateInit),
-		audioQueue:         make(chan []int16, 10), // buffered channel for peer audio
+		peerVolumes:        make(map[string]float32), // initialize peer volumes map
+		audioQueue:         make(chan []int16, 10),   // buffered channel for peer audio
 	}
 }
 
 func (vc *VoiceClient) JoinChannel(wsAddr, channel string) error {
 	portaudio.Initialize()
+
+	// Recreate audioQueue in case it was closed on previous LeaveChannel
+	vc.audioQueue = make(chan []int16, 10)
+
 	if vc.inputDeviceName == "" {
 		if d, err := portaudio.DefaultInputDevice(); err == nil {
 			vc.inputDeviceName = d.Name
@@ -116,14 +125,19 @@ func (vc *VoiceClient) LeaveChannel() {
 	if !vc.isConnected {
 		return
 	}
-	// Set isConnected = false FIRST so all captureMic/playAudio goroutines
+	// Set isConnected = false FIRST so all captureMic/playAudio/playbackManager goroutines
 	// exit their loops on the next iteration check.
 	vc.isConnected = false
+
+	// Close audioQueue to unblock playbackManager and playAudio goroutines
+	close(vc.audioQueue)
+
 	vc.send(SignalMsg{
 		Type:    "leave",
 		From:    vc.myNick,
 		Channel: vc.channel,
 	})
+
 	vc.mu.Lock()
 	pcs := make([]*webrtc.PeerConnection, 0, len(vc.pc))
 	for _, pc := range vc.pc {
@@ -132,10 +146,17 @@ func (vc *VoiceClient) LeaveChannel() {
 	vc.pc = make(map[string]*webrtc.PeerConnection)
 	vc.micTracks = nil
 	vc.mu.Unlock()
+
+	// Clear ICE candidate queues to free memory
+	vc.iceQueueMu.Lock()
+	vc.iceCandidateQueues = make(map[string][]*webrtc.ICECandidateInit)
+	vc.iceQueueMu.Unlock()
+
 	// Close PCs in goroutines — TURN teardown can block for seconds.
 	for _, pc := range pcs {
 		go pc.Close()
 	}
+
 	// Close streams to unblock any goroutine currently blocked in stream.Read/Write.
 	vc.audioMu.Lock()
 	if vc.stream != nil {
@@ -149,8 +170,17 @@ func (vc *VoiceClient) LeaveChannel() {
 		vc.outputStream = nil
 	}
 	vc.audioMu.Unlock()
-	vc.ws.Close()
-	portaudio.Terminate()
+
+	// Close WebSocket to unblock readLoop
+	vc.mu.Lock()
+	if vc.ws != nil {
+		vc.ws.Close()
+		vc.ws = nil
+	}
+	vc.mu.Unlock()
+
+	// PortAudio Terminate only once at app shutdown, not on each channel leave
+	// Removed: portaudio.Terminate()
 }
 
 // playbackManager owns the single output stream for the entire session
@@ -827,6 +857,40 @@ func (vc *VoiceClient) applyAGC(buf []float32, targetRMS float32) {
 			buf[i] = -32768
 		}
 	}
+}
+
+// SetPeerVolume sets the volume multiplier for a specific peer (1.0 = 100%, range 0.0-2.0)
+func (vc *VoiceClient) SetPeerVolume(nick string, volume float32) {
+	// Clamp volume to 0.0-2.0 range
+	if volume < 0.0 {
+		volume = 0.0
+	} else if volume > 2.0 {
+		volume = 2.0
+	}
+
+	vc.volumeMu.Lock()
+	defer vc.volumeMu.Unlock()
+
+	if volume == 1.0 {
+		// Remove entry if setting to default
+		delete(vc.peerVolumes, nick)
+		fmt.Printf("VOICE: SetPeerVolume - reset volume for %s to default (100%%)\n", nick)
+	} else {
+		vc.peerVolumes[nick] = volume
+		percentage := int(volume * 100)
+		fmt.Printf("VOICE: SetPeerVolume - set volume for %s to %d%%\n", nick, percentage)
+	}
+}
+
+// GetPeerVolume gets the volume multiplier for a specific peer (defaults to 1.0 = 100%)
+func (vc *VoiceClient) GetPeerVolume(nick string) float32 {
+	vc.volumeMu.Lock()
+	defer vc.volumeMu.Unlock()
+
+	if volume, exists := vc.peerVolumes[nick]; exists {
+		return volume
+	}
+	return 1.0 // default to 100%
 }
 
 func (vc *VoiceClient) captureMic(track *webrtc.TrackLocalStaticSample) {
