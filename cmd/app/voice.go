@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -22,23 +22,25 @@ var (
 )
 
 type VoiceClient struct {
-	ws            *websocket.Conn
-	pc            map[string]*webrtc.PeerConnection // nick → peer connection
-	mu            sync.Mutex
-	myNick        string
-	channel       string
-	stream        *portaudio.Stream
-	isConnected   bool
-	isSpeaking    bool
-	inputDevice   *portaudio.DeviceInfo
-	outputDevice  *portaudio.DeviceInfo
-	onSpeaking    func(nick string, speaking bool)
-	onMemberJoin  func(nick string)
-	onMemberLeave func(nick string)
-	audioMu       sync.Mutex                       // protects stream, outputStream
-	outputStream  *portaudio.Stream                // current output stream (owned by playAudio)
-	outputGen     uint32                           // atomic; increment to tell playAudio to reopen output
-	micTracks     []*webrtc.TrackLocalStaticSample // active mic tracks for RestartAudio
+	ws               *websocket.Conn
+	pc               map[string]*webrtc.PeerConnection // nick → peer connection
+	mu               sync.Mutex
+	myNick           string
+	channel          string
+	stream           *portaudio.Stream
+	isConnected      bool
+	isSpeaking       bool
+	inputDeviceName  string // store device name, not pointer (pointers become stale after Initialize/Terminate)
+	outputDeviceName string // store device name, not pointer (pointers become stale after Initialize/Terminate)
+	onSpeaking       func(nick string, speaking bool)
+	onMemberJoin     func(nick string)
+	onMemberLeave    func(nick string)
+	audioMu          sync.Mutex                       // protects stream, outputStream
+	outputStream     *portaudio.Stream                // central output stream (owned by playbackManager)
+	micTracks        []*webrtc.TrackLocalStaticSample // active mic tracks for RestartAudio
+
+	// Audio playback management
+	audioQueue chan []int16 // queue of audio samples from all peers
 
 	// AGC (Automatic Gain Control)
 	agcTargetLevel float32 // target RMS level (0.1 to 0.5 typically)
@@ -70,19 +72,20 @@ func NewVoiceClient(myNick string) *VoiceClient {
 		agcTargetLevel:     5000, // target RMS in int16 scale (lowered to prevent echo amplification)
 		agcCurrentGain:     1.0,  // start with unity gain
 		iceCandidateQueues: make(map[string][]*webrtc.ICECandidateInit),
+		audioQueue:         make(chan []int16, 10), // buffered channel for peer audio
 	}
 }
 
 func (vc *VoiceClient) JoinChannel(wsAddr, channel string) error {
 	portaudio.Initialize()
-	if vc.inputDevice == nil {
+	if vc.inputDeviceName == "" {
 		if d, err := portaudio.DefaultInputDevice(); err == nil {
-			vc.inputDevice = d
+			vc.inputDeviceName = d.Name
 		}
 	}
-	if vc.outputDevice == nil {
+	if vc.outputDeviceName == "" {
 		if d, err := portaudio.DefaultOutputDevice(); err == nil {
-			vc.outputDevice = d
+			vc.outputDeviceName = d.Name
 		}
 	}
 	conn, _, err := websocket.DefaultDialer.Dial(wsAddr+"/ws", nil)
@@ -92,6 +95,9 @@ func (vc *VoiceClient) JoinChannel(wsAddr, channel string) error {
 	vc.ws = conn
 	vc.channel = channel
 	vc.isConnected = true
+
+	// start playback manager to handle audio from all peers
+	go vc.playbackManager()
 
 	// send join message
 	vc.send(SignalMsg{
@@ -147,22 +153,205 @@ func (vc *VoiceClient) LeaveChannel() {
 	portaudio.Terminate()
 }
 
-// RestartAudio signals playAudio to reopen the output stream on the next packet
-// (no abrupt close — avoids races with Write()), and restarts mic capture.
-func (vc *VoiceClient) RestartAudio() {
-	// Signal output switch. playAudio checks this after each Write() and reopens
-	// gracefully with the new vc.outputDevice. We must NOT close vc.outputStream
-	// here — that would race with an in-progress Write().
-	atomic.AddUint32(&vc.outputGen, 1)
+// playbackManager owns the single output stream for the entire session
+// All peer audio is sent to this manager via the audioQueue channel
+func (vc *VoiceClient) playbackManager() {
+	fmt.Println("VOICE: playbackManager started")
+	sampleRate := 48000
+	channels := 1
+	framesPerBuffer := 960
+	buf := make([]int16, framesPerBuffer)
 
-	// Restart mic input stream.
+	// Open output stream once for the entire session
+	vc.audioMu.Lock()
+	if vc.outputStream != nil {
+		vc.outputStream.Stop()
+		vc.outputStream.Close()
+	}
+
+	// Log all available output devices for debugging
+	if devices, err := portaudio.Devices(); err == nil {
+		fmt.Printf("VOICE: playbackManager - available output devices: %d\n", len(devices))
+		for i, d := range devices {
+			if d.MaxOutputChannels > 0 {
+				fmt.Printf("  [%d] %s (max channels: %d)\n", i, d.Name, d.MaxOutputChannels)
+			}
+		}
+	}
+
+	var s *portaudio.Stream
+	var err error
+	var outputDev *portaudio.DeviceInfo
+
+	// Look up device by name using prefix matching (handles truncated names)
+	fmt.Printf("VOICE: playbackManager - looking for output device by prefix: '%s'\n", vc.outputDeviceName)
+	if vc.outputDeviceName != "" {
+		if devices, err := portaudio.Devices(); err == nil {
+			fmt.Printf("VOICE: playbackManager - searching %d devices for match\n", len(devices))
+			for _, d := range devices {
+				if d.MaxOutputChannels > 0 {
+					// Use prefix matching to handle truncated device names
+					if strings.HasPrefix(vc.outputDeviceName, d.Name) || strings.HasPrefix(d.Name, vc.outputDeviceName) {
+						fmt.Printf("VOICE: playbackManager - MATCH FOUND: '%s'\n", d.Name)
+						outputDev = d
+						break
+					}
+				}
+			}
+		}
+	}
+
+	if outputDev != nil {
+		fmt.Printf("VOICE: playbackManager - outputDevice selected: %v\n", outputDev.Name)
+		params := portaudio.StreamParameters{
+			Output: portaudio.StreamDeviceParameters{
+				Device:   outputDev,
+				Channels: channels,
+				Latency:  outputDev.DefaultLowOutputLatency,
+			},
+			SampleRate:      float64(sampleRate),
+			FramesPerBuffer: framesPerBuffer,
+		}
+		s, err = portaudio.OpenStream(params, buf)
+
+		// If selected device fails, fallback to default
+		if err != nil {
+			fmt.Printf("VOICE: playbackManager - selected device '%s' failed: %v, falling back to default\n", outputDev.Name, err)
+			s, err = portaudio.OpenDefaultStream(0, channels, float64(sampleRate), framesPerBuffer, buf)
+		}
+	} else {
+		fmt.Println("VOICE: playbackManager - no output device selected, using default")
+		s, err = portaudio.OpenDefaultStream(0, channels, float64(sampleRate), framesPerBuffer, buf)
+	}
+	if err != nil {
+		fmt.Printf("VOICE: playbackManager - stream open failed (no fallback available): %v\n", err)
+		vc.audioMu.Unlock()
+		return
+	}
+	s.Start()
+	vc.outputStream = s
+	fmt.Println("VOICE: playbackManager - stream ready")
+	vc.audioMu.Unlock()
+
+	// Cleanup when disconnecting
+	defer func() {
+		vc.audioMu.Lock()
+		if vc.outputStream == s {
+			s.Stop()
+			s.Close()
+			vc.outputStream = nil
+		}
+		vc.audioMu.Unlock()
+	}()
+
+	// Loop: receive audio from all peers and write to output stream
+	framesSent := 0
+	for vc.isConnected {
+		select {
+		case audioData, ok := <-vc.audioQueue:
+			if !ok {
+				return
+			}
+			framesSent++
+			if framesSent%100 == 0 {
+				fmt.Printf("VOICE: playbackManager processed %d frames, first sample: %d\n", framesSent, audioData[0])
+			}
+
+			// Copy audio data to buffer
+			if len(audioData) > len(buf) {
+				fmt.Printf("VOICE: playbackManager - audio chunk larger than buffer (%d > %d)\n", len(audioData), len(buf))
+				continue
+			}
+			copy(buf, audioData)
+
+			// Write to output stream
+			if err := s.Write(); err != nil {
+				fmt.Printf("VOICE: playbackManager - write error: %v\n", err)
+				// Try to reopen stream with current device settings
+				vc.audioMu.Lock()
+				s.Stop()
+				s.Close()
+
+				// Try to reopen with current device setting using prefix matching
+				var reopenDev *portaudio.DeviceInfo
+				if vc.outputDeviceName != "" {
+					if devices, err := portaudio.Devices(); err == nil {
+						for _, d := range devices {
+							if strings.HasPrefix(vc.outputDeviceName, d.Name) || strings.HasPrefix(d.Name, vc.outputDeviceName) {
+								reopenDev = d
+								break
+							}
+						}
+					}
+				}
+
+				if reopenDev != nil {
+					fmt.Printf("VOICE: playbackManager - attempting to reopen with device: %v\n", reopenDev.Name)
+					params := portaudio.StreamParameters{
+						Output: portaudio.StreamDeviceParameters{
+							Device:   reopenDev,
+							Channels: channels,
+							Latency:  reopenDev.DefaultLowOutputLatency,
+						},
+						SampleRate:      float64(sampleRate),
+						FramesPerBuffer: framesPerBuffer,
+					}
+					s, err = portaudio.OpenStream(params, buf)
+					if err != nil {
+						fmt.Printf("VOICE: playbackManager - reopen failed, trying default: %v\n", err)
+						s, err = portaudio.OpenDefaultStream(0, channels, float64(sampleRate), framesPerBuffer, buf)
+					}
+				} else {
+					fmt.Println("VOICE: playbackManager - using default device for recovery")
+					s, err = portaudio.OpenDefaultStream(0, channels, float64(sampleRate), framesPerBuffer, buf)
+				}
+				if err == nil {
+					s.Start()
+					vc.outputStream = s
+					fmt.Println("VOICE: playbackManager - stream reopened successfully")
+				} else {
+					fmt.Printf("VOICE: playbackManager - failed to reopen stream: %v\n", err)
+				}
+				vc.audioMu.Unlock()
+			}
+		default:
+			// No audio available, skip this iteration to avoid busy waiting
+			time.Sleep(1 * time.Millisecond)
+		}
+	}
+}
+
+// RestartAudio signals audio to reopen streams with new devices
+// Gracefully handles failures (e.g., new input device can't be opened)
+func (vc *VoiceClient) RestartAudio() {
+	fmt.Println("VOICE: RestartAudio called - closing old input stream")
+
+	// Close old input stream
 	vc.audioMu.Lock()
 	if vc.stream != nil {
+		fmt.Println("VOICE: RestartAudio - stopping and closing old stream")
 		vc.stream.Stop()
 		vc.stream.Close()
 		vc.stream = nil
 	}
 	vc.audioMu.Unlock()
+
+	// IMPORTANT: Reset inputDeviceName to empty string to force re-detection on restart
+	// This prevents stale device pointers after device switches
+	fmt.Println("VOICE: RestartAudio - resetting input device name to force re-detection")
+	vc.mu.Lock()
+	vc.inputDeviceName = ""
+	vc.mu.Unlock()
+
+	// List available devices for debugging
+	if devices, err := portaudio.Devices(); err == nil {
+		fmt.Printf("VOICE: RestartAudio - available input devices: %d\n", len(devices))
+		for i, d := range devices {
+			if d.MaxInputChannels > 0 {
+				fmt.Printf("  [%d] %s (max channels: %d)\n", i, d.Name, d.MaxInputChannels)
+			}
+		}
+	}
 
 	// Give old captureMic goroutine time to exit before relaunching.
 	time.Sleep(80 * time.Millisecond)
@@ -171,9 +360,33 @@ func (vc *VoiceClient) RestartAudio() {
 	micTracks := make([]*webrtc.TrackLocalStaticSample, len(vc.micTracks))
 	copy(micTracks, vc.micTracks)
 	vc.mu.Unlock()
+
+	// Restart captureMic with new input device
+	// If it fails to open, it will retry or fall back to default
+	fmt.Printf("VOICE: RestartAudio - restarting %d capture goroutines\n", len(micTracks))
 	for _, t := range micTracks {
 		go vc.captureMic(t)
 	}
+}
+
+// RestartPlayback restarts the output stream with the new output device
+func (vc *VoiceClient) RestartPlayback() {
+	fmt.Println("VOICE: RestartPlayback called - restarting output stream")
+
+	// Signal playbackManager to close and restart
+	vc.audioMu.Lock()
+	if vc.outputStream != nil {
+		fmt.Println("VOICE: RestartPlayback - closing old output stream")
+		vc.outputStream.Stop()
+		vc.outputStream.Close()
+		vc.outputStream = nil
+	}
+	vc.audioMu.Unlock()
+
+	// Give playbackManager time to notice the stream is closed and restart
+	time.Sleep(50 * time.Millisecond)
+
+	fmt.Println("VOICE: RestartPlayback - old stream closed, playbackManager will restart")
 }
 
 func (vc *VoiceClient) send(msg SignalMsg) {
@@ -639,25 +852,58 @@ func (vc *VoiceClient) captureMic(track *webrtc.TrackLocalStaticSample) {
 	var err error
 
 	fmt.Println("VOICE: captureMic - opening input device...")
-	if vc.inputDevice != nil {
+
+	// Look up device by name using prefix matching (handles truncated names)
+	var inputDev *portaudio.DeviceInfo
+	fmt.Printf("VOICE: captureMic - looking for input device by prefix: '%s'\n", vc.inputDeviceName)
+	if vc.inputDeviceName != "" {
+		if devices, _ := portaudio.Devices(); devices != nil {
+			fmt.Printf("VOICE: captureMic - searching devices for match\n")
+			for _, d := range devices {
+				if d.MaxInputChannels > 0 {
+					// Use prefix matching to handle truncated device names
+					if strings.HasPrefix(vc.inputDeviceName, d.Name) || strings.HasPrefix(d.Name, vc.inputDeviceName) {
+						fmt.Printf("VOICE: captureMic - MATCH FOUND: '%s'\n", d.Name)
+						inputDev = d
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// Attempt with selected device if found
+	if inputDev != nil {
 		// use selected device
-		fmt.Printf("VOICE: captureMic - using device: %v\n", vc.inputDevice.Name)
+		fmt.Printf("VOICE: captureMic - using device: %v (channels: %d, max input channels: %d)\n",
+			inputDev.Name, channels, inputDev.MaxInputChannels)
 		params := portaudio.StreamParameters{
 			Input: portaudio.StreamDeviceParameters{
-				Device:   vc.inputDevice,
+				Device:   inputDev,
 				Channels: channels,
-				Latency:  vc.inputDevice.DefaultLowInputLatency,
+				Latency:  inputDev.DefaultLowInputLatency,
 			},
 			SampleRate:      float64(sampleRate),
 			FramesPerBuffer: framesPerBuffer,
 		}
 		stream, err = portaudio.OpenStream(params, buf)
+
+		// If selected device fails, fallback to default
+		if err != nil {
+			fmt.Printf("VOICE: captureMic - selected device failed: %v, falling back to default\n", err)
+			stream, err = portaudio.OpenDefaultStream(channels, 0, float64(sampleRate), framesPerBuffer, buf)
+		}
 	} else {
 		fmt.Println("VOICE: captureMic - using default input device")
+		// Get and log default device info
+		if defDev, err := portaudio.DefaultInputDevice(); err == nil {
+			fmt.Printf("VOICE: captureMic - default device: %v (channels: %d)\n",
+				defDev.Name, defDev.MaxInputChannels)
+		}
 		stream, err = portaudio.OpenDefaultStream(channels, 0, float64(sampleRate), framesPerBuffer, buf)
 	}
 	if err != nil {
-		fmt.Printf("VOICE: captureMic - stream open failed: %v\n", err)
+		fmt.Printf("VOICE: captureMic - stream open failed (no fallback available): %v\n", err)
 		return
 	}
 	fmt.Println("VOICE: captureMic - stream opened successfully")
@@ -686,11 +932,37 @@ func (vc *VoiceClient) captureMic(track *webrtc.TrackLocalStaticSample) {
 	fmt.Println("VOICE: captureMic - denoiser initialized")
 	defer denoiser.Destroy()
 
+	frameCount := 0
+	zeroFrameCount := 0
 	for vc.isConnected {
 		readErr := stream.Read()
 		if readErr != nil {
 			fmt.Println("voice: read error (device disconnected?):", readErr)
 			return
+		}
+
+		frameCount++
+
+		// Check for stuck/silent device - if we get too many all-zero frames, something is wrong
+		allZero := true
+		for _, s := range buf {
+			if s != 0 {
+				allZero = false
+				break
+			}
+		}
+		if allZero {
+			zeroFrameCount++
+		} else {
+			zeroFrameCount = 0 // reset counter
+		}
+
+		if zeroFrameCount > 500 && zeroFrameCount%100 == 0 {
+			fmt.Printf("VOICE: WARNING - Device returning all zeros for %d+ consecutive frames! Device may be disconnected.\n", zeroFrameCount)
+		}
+
+		if frameCount%100 == 0 {
+			fmt.Printf("voice: frame %d read successfully, first sample: %d (all-zero: %v)\n", frameCount, buf[0], allZero)
 		}
 
 		// convert int16 → float32
@@ -709,8 +981,12 @@ func (vc *VoiceClient) captureMic(track *webrtc.TrackLocalStaticSample) {
 			buf[i] = int16(f)
 		}
 
-		// VAD: threshold (0.35) to filter out echo and background noise without cutting speech
-		isVoice := vad > 0.35
+		// VAD: threshold (0.7) to filter out echo and background noise without cutting speech
+		isVoice := vad > 0.7
+
+		if frameCount%100 == 0 {
+			fmt.Printf("voice: VAD value: %.4f, isVoice: %v\n", vad, isVoice)
+		}
 
 		if isVoice != lastSpeakingStatus && time.Since(lastStatusTime) > 200*time.Millisecond {
 			lastSpeakingStatus = isVoice
@@ -768,69 +1044,14 @@ func (vc *VoiceClient) playAudio(track *webrtc.TrackRemote) {
 	framesPerBuffer := 960
 	buf := make([]int16, framesPerBuffer)
 
-	// openStream closes any previous output stream and opens a fresh one.
-	// Must be called only from the playAudio goroutine.
-	openStream := func() *portaudio.Stream {
-		vc.audioMu.Lock()
-		defer vc.audioMu.Unlock()
-		if vc.outputStream != nil {
-			vc.outputStream.Stop()
-			vc.outputStream.Close()
-			vc.outputStream = nil
-		}
-		var s *portaudio.Stream
-		var err error
-		if vc.outputDevice != nil {
-			fmt.Printf("VOICE: playAudio - opening device: %v\n", vc.outputDevice.Name)
-			params := portaudio.StreamParameters{
-				Output: portaudio.StreamDeviceParameters{
-					Device:   vc.outputDevice,
-					Channels: channels,
-					Latency:  vc.outputDevice.DefaultLowOutputLatency,
-				},
-				SampleRate:      float64(sampleRate),
-				FramesPerBuffer: framesPerBuffer,
-			}
-			s, err = portaudio.OpenStream(params, buf)
-		} else {
-			s, err = portaudio.OpenDefaultStream(0, channels, float64(sampleRate), framesPerBuffer, buf)
-		}
-		if err != nil {
-			fmt.Printf("VOICE: playAudio - stream open failed: %v\n", err)
-			return nil
-		}
-		s.Start()
-		vc.outputStream = s
-		fmt.Println("VOICE: playAudio - stream ready")
-		return s
-	}
-
-	stream := openStream()
-	if stream == nil {
-		return
-	}
-	// Cleanup when this goroutine exits (e.g. RTP error on disconnect).
-	// LeaveChannel may have already closed it; the pointer check makes it safe.
-	defer func() {
-		vc.audioMu.Lock()
-		if vc.outputStream == stream {
-			stream.Stop()
-			stream.Close()
-			vc.outputStream = nil
-		}
-		vc.audioMu.Unlock()
-	}()
-
 	dec, err := opus.NewDecoder(sampleRate, channels)
 	if err != nil {
 		fmt.Println("voice: opus decoder error:", err)
 		return
 	}
 
-	// Track the generation we were opened at. RestartAudio increments outputGen
-	// to request a device switch. We check after each Write() — no concurrent close.
-	myGen := atomic.LoadUint32(&vc.outputGen)
-
+	framesReceived := 0
+	// Read RTP packets, decode, and send to playbackManager queue
 	for vc.isConnected {
 		pkt, _, err := track.ReadRTP()
 		if err != nil {
@@ -843,23 +1064,23 @@ func (vc *VoiceClient) playAudio(track *webrtc.TrackRemote) {
 			continue
 		}
 
-		// Write to the current stream. No lock held — write is blocking (~20ms)
-		// and RestartAudio never touches vc.outputStream, so there is no race.
-		if err := stream.Write(); err != nil {
-			fmt.Println("voice: write error, reopening:", err)
-			// Treat a write error the same as a device switch request.
-			atomic.AddUint32(&vc.outputGen, 1)
+		framesReceived++
+		if framesReceived%100 == 0 {
+			fmt.Printf("VOICE: playAudio received %d RTP frames, first decoded sample: %d\n", framesReceived, buf[0])
 		}
 
-		// After each write, check if a device switch was requested.
-		curGen := atomic.LoadUint32(&vc.outputGen)
-		if curGen != myGen {
-			myGen = curGen
-			newStream := openStream()
-			if newStream == nil {
-				return
-			}
-			stream = newStream
+		// Copy the decoded audio before sending to avoid buffer reuse issues
+		audioCopy := make([]int16, len(buf))
+		copy(audioCopy, buf)
+
+		// Send decoded audio to playback manager
+		// Non-blocking send to avoid deadlock if queue is full
+		select {
+		case vc.audioQueue <- audioCopy:
+			// Sent successfully
+		default:
+			// Queue full, drop frame to maintain responsiveness
+			fmt.Println("VOICE: audio queue full, dropping frame")
 		}
 	}
 }
