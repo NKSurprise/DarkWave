@@ -589,11 +589,9 @@ func (vc *VoiceClient) initiateCall(targetNick string) {
 	// start mic capture to this track
 	go vc.captureMic(audioTrack)
 
-	// handle incoming audio
-	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		fmt.Println("VOICE: OnTrack fired, codec:", track.Codec().MimeType)
-		go vc.playAudio(track)
-	})
+	// NOTE: DO NOT add OnTrack handler here - initiator sends only, responder receives
+	// This prevents self-loop echo where your audio gets routed back to you
+	// Only the answerer (handleOffer) will have OnTrack to receive remote audio
 
 	// relay ICE candidates
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
