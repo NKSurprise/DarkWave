@@ -40,8 +40,8 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 	var roomsWithVoice []RoomWithVoice
 	var voiceClient *VoiceClient
 	var voiceMembers []VoiceMember
-	var savedInputDevice *portaudio.DeviceInfo
-	var savedOutputDevice *portaudio.DeviceInfo
+	var savedInputDeviceName string
+	var savedOutputDeviceName string
 
 	// -- FRIENDS HOME LIST --
 	friendsHomeList := widget.NewList(
@@ -316,12 +316,12 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 			currentDMKey = nil
 			members = []string{}
 			membersList.Refresh()
-			
+
 			// Clear all voice channels (we'll fetch new ones for current room only)
 			for i := range roomsWithVoice {
 				roomsWithVoice[i].voiceChannels = nil
 			}
-			
+
 			conn.send("/join " + r.name)
 			conn.send("/voicechannels")
 			conn.send("/rooms") // Refresh rooms list after joining
@@ -350,14 +350,23 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 			channelName := item.chanName
 			go func() {
 				if voiceClient != nil {
-					savedInputDevice = voiceClient.inputDevice
-					savedOutputDevice = voiceClient.outputDevice
+					savedInputDeviceName = voiceClient.inputDeviceName
+					savedOutputDeviceName = voiceClient.outputDeviceName
 					voiceClient.LeaveChannel()
 					voiceClient = nil
 				}
+
+				// Load saved device preferences if not already stored
+				if savedInputDeviceName == "" {
+					savedInputDeviceName = currentApp.Preferences().String("audio.inputDeviceName")
+				}
+				if savedOutputDeviceName == "" {
+					savedOutputDeviceName = currentApp.Preferences().String("audio.outputDeviceName")
+				}
+
 				voiceClient = NewVoiceClient(myNick)
-				voiceClient.inputDevice = savedInputDevice
-				voiceClient.outputDevice = savedOutputDevice
+				voiceClient.inputDeviceName = savedInputDeviceName
+				voiceClient.outputDeviceName = savedOutputDeviceName
 
 				voiceClient.onSpeaking = func(nick string, speaking bool) {
 					fyne.Do(func() {
@@ -419,11 +428,15 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 
 	settingsBtn := widget.NewButton("⚙ Audio", func() {
 		showAudioSettings(w, voiceClient, func(input, output *portaudio.DeviceInfo) {
-			savedInputDevice = input
-			savedOutputDevice = output
-			if voiceClient != nil {
-				voiceClient.inputDevice = input
-				voiceClient.outputDevice = output
+			if input != nil {
+				savedInputDeviceName = input.Name
+			} else {
+				savedInputDeviceName = ""
+			}
+			if output != nil {
+				savedOutputDeviceName = output.Name
+			} else {
+				savedOutputDeviceName = ""
 			}
 		})
 	})

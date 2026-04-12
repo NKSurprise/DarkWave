@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -69,21 +70,36 @@ func showAudioSettings(w fyne.Window, vc *VoiceClient, onSave func(*portaudio.De
 		outputNames = append(outputNames, d.Name)
 	}
 
-	// find current selection indices
+	// find current selection indices using prefix matching (handles truncated device names)
+	// Load from preferences if vc is nil (not in call) or use vc values
+	savedInputName := currentApp.Preferences().String("audio.inputDeviceName")
+	savedOutputName := currentApp.Preferences().String("audio.outputDeviceName")
+
+	inputName := savedInputName
+	outputName := savedOutputName
+	if vc != nil {
+		if vc.inputDeviceName != "" {
+			inputName = vc.inputDeviceName
+		}
+		if vc.outputDeviceName != "" {
+			outputName = vc.outputDeviceName
+		}
+	}
+
 	inputIdx := 0
 	outputIdx := 0
-	if vc != nil {
-		for i, d := range inputDevices {
-			if vc.inputDevice != nil && d.Name == vc.inputDevice.Name {
-				inputIdx = i
-				break
-			}
+	for i, d := range inputDevices {
+		if inputName != "" && (d.Name == inputName ||
+			strings.HasPrefix(inputName, d.Name) || strings.HasPrefix(d.Name, inputName)) {
+			inputIdx = i
+			break
 		}
-		for i, d := range outputDevices {
-			if vc.outputDevice != nil && d.Name == vc.outputDevice.Name {
-				outputIdx = i
-				break
-			}
+	}
+	for i, d := range outputDevices {
+		if outputName != "" && (d.Name == outputName ||
+			strings.HasPrefix(outputName, d.Name) || strings.HasPrefix(d.Name, outputName)) {
+			outputIdx = i
+			break
 		}
 	}
 
@@ -110,21 +126,45 @@ func showAudioSettings(w fyne.Window, vc *VoiceClient, onSave func(*portaudio.De
 		if !save {
 			return
 		}
-		var inputDev, outputDev *portaudio.DeviceInfo
+		var inputName, outputName string
 		if inputSelect.SelectedIndex() >= 0 && inputSelect.SelectedIndex() < len(inputDevices) {
-			inputDev = inputDevices[inputSelect.SelectedIndex()]
+			inputName = inputDevices[inputSelect.SelectedIndex()].Name
 		}
 		if outputSelect.SelectedIndex() >= 0 && outputSelect.SelectedIndex() < len(outputDevices) {
-			outputDev = outputDevices[outputSelect.SelectedIndex()]
+			outputName = outputDevices[outputSelect.SelectedIndex()].Name
 		}
+
+		// Save to preferences so they persist between app sessions
+		currentApp.Preferences().SetString("audio.inputDeviceName", inputName)
+		currentApp.Preferences().SetString("audio.outputDeviceName", outputName)
+
 		if vc != nil {
-			vc.inputDevice = inputDev
-			vc.outputDevice = outputDev
+			vc.inputDeviceName = inputName
+			vc.outputDeviceName = outputName
 			if vc.isConnected {
 				vc.RestartAudio()
+				vc.RestartPlayback()
 			}
 		}
 		if onSave != nil {
+			// Get the actual device pointers for onSave callback (for compatibility)
+			var inputDev, outputDev *portaudio.DeviceInfo
+			if inputName != "" {
+				for _, d := range inputDevices {
+					if d.Name == inputName {
+						inputDev = d
+						break
+					}
+				}
+			}
+			if outputName != "" {
+				for _, d := range outputDevices {
+					if d.Name == outputName {
+						outputDev = d
+						break
+					}
+				}
+			}
 			onSave(inputDev, outputDev)
 		}
 	}, w)
