@@ -30,6 +30,77 @@ type VoiceMember struct {
 	speaking bool
 }
 
+// VoiceMemberItem is a custom widget that displays a voice member and handles right-click for volume adjustment
+type VoiceMemberItem struct {
+	widget.BaseWidget
+	nick         string
+	speaking     bool
+	onRightClick func(nick string)
+}
+
+func NewVoiceMemberItem(nick string, speaking bool, onRightClick func(string)) *VoiceMemberItem {
+	item := &VoiceMemberItem{
+		nick:         nick,
+		speaking:     speaking,
+		onRightClick: onRightClick,
+	}
+	item.ExtendBaseWidget(item)
+	return item
+}
+
+func (m *VoiceMemberItem) CreateRenderer() fyne.WidgetRenderer {
+	indicator := "○"
+	if m.speaking {
+		indicator = "●"
+	}
+	text := widget.NewLabel(indicator + " " + m.nick)
+	return &voiceMemberRenderer{
+		item: m,
+		text: text,
+	}
+}
+
+type voiceMemberRenderer struct {
+	item *VoiceMemberItem
+	text *widget.Label
+}
+
+func (r *voiceMemberRenderer) Layout(size fyne.Size) {
+	r.text.Resize(size)
+}
+
+func (r *voiceMemberRenderer) MinSize() fyne.Size {
+	return r.text.MinSize()
+}
+
+func (r *voiceMemberRenderer) Refresh() {
+	indicator := "○"
+	if r.item.speaking {
+		indicator = "●"
+	}
+	r.text.SetText(indicator + " " + r.item.nick)
+}
+
+func (r *voiceMemberRenderer) Objects() []fyne.CanvasObject {
+	return []fyne.CanvasObject{r.text}
+}
+
+func (r *voiceMemberRenderer) Destroy() {}
+
+func (m *VoiceMemberItem) Tapped(e *fyne.PointEvent) {
+	// Right-click handled via MouseDown in the container
+	if m.onRightClick != nil {
+		m.onRightClick(m.nick)
+	}
+}
+
+func (m *VoiceMemberItem) TappedSecondary(e *fyne.PointEvent) {
+	// Secondary tap (right-click on some devices)
+	if m.onRightClick != nil {
+		m.onRightClick(m.nick)
+	}
+}
+
 func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr string) fyne.CanvasObject {
 	var msgs []string
 	var friends []FriendStatus
@@ -144,25 +215,71 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 		friendsHomeList.Unselect(i)
 	}
 
-	voiceMembersList := widget.NewList(
-		func() int { return len(voiceMembers) },
-		func() fyne.CanvasObject {
-			indicator := widget.NewLabel("○")
-			name := widget.NewLabel("")
-			return container.NewHBox(indicator, name)
-		},
-		func(i widget.ListItemID, o fyne.CanvasObject) {
-			row := o.(*fyne.Container)
-			indicator := row.Objects[0].(*widget.Label)
-			name := row.Objects[1].(*widget.Label)
-			name.SetText(voiceMembers[i].nick)
-			if voiceMembers[i].speaking {
-				indicator.SetText("●")
-			} else {
-				indicator.SetText("○")
+	// Create voice members list with right-click volume control
+	voiceMembersBox := container.NewVBox()
+	voiceMembersScroll := container.NewScroll(voiceMembersBox)
+	var volumePopup *widget.PopUp
+
+	rebuildVoiceList := func() {
+		voiceMembersBox.Objects = []fyne.CanvasObject{}
+
+		for _, member := range voiceMembers {
+			memberNick := member.nick
+			memberSpeaking := member.speaking
+
+			// Create custom member item with right-click handler (skip for self)
+			var clickHandler func(string)
+			if memberNick != myNick {
+				// Only allow adjusting other members' volumes, not your own
+				clickHandler = func(nick string) {
+					// Right-click handler - show volume popup
+					currentVolume := float32(100)
+					if voiceClient != nil {
+						currentVolume = voiceClient.GetPeerVolume(nick) * 100
+					}
+
+					volumeSlider := widget.NewSlider(0, 200)
+					volumeSlider.Value = float64(currentVolume)
+					volumeSlider.Step = 1
+
+					volumeLabel := widget.NewLabel(fmt.Sprintf("%.0f%%", currentVolume))
+
+					volumeSlider.OnChanged = func(v float64) {
+						volumeLabel.SetText(fmt.Sprintf("%.0f%%", v))
+						if voiceClient != nil {
+							voiceClient.SetPeerVolume(nick, float32(v)/100.0)
+						}
+					}
+
+					// Create volume control popup (wider)
+					volumeContent := container.NewVBox(
+						widget.NewLabelWithStyle(nick, fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
+						volumeSlider,
+						volumeLabel,
+					)
+
+					if volumePopup != nil {
+						volumePopup.Hide()
+					}
+
+					volumePopup = widget.NewPopUp(volumeContent, w.Canvas())
+					volumePopup.Resize(fyne.NewSize(300, 150)) // Make it wider
+					volumePopup.ShowAtPosition(fyne.NewPos(
+						float32(w.Canvas().Size().Width)-320,
+						300,
+					))
+				}
 			}
-		},
-	)
+
+			memberItem := NewVoiceMemberItem(memberNick, memberSpeaking, clickHandler)
+			voiceMembersBox.Add(memberItem)
+		}
+
+		voiceMembersScroll.Refresh()
+	}
+
+	rebuildVoiceList()
+	voiceMembersList := voiceMembersScroll
 
 	// --- voice sidebar member infrastructure (declared early so leaveVoiceBtn can use them) ---
 	var vcMembersCache sync.Map
@@ -192,7 +309,7 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 			currentVoiceChan = ""
 		}
 		voiceMembers = []VoiceMember{}
-		voiceMembersList.Refresh()
+		rebuildVoiceList()
 		roomsList.Refresh()
 		leaveVoiceBtn.Hide()
 	})
@@ -373,7 +490,7 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 						for i, m := range voiceMembers {
 							if m.nick == nick {
 								voiceMembers[i].speaking = speaking
-								voiceMembersList.Refresh()
+								rebuildVoiceList()
 								return
 							}
 						}
@@ -382,7 +499,7 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 				voiceClient.onMemberJoin = func(nick string) {
 					fyne.Do(func() {
 						voiceMembers = append(voiceMembers, VoiceMember{nick: nick})
-						voiceMembersList.Refresh()
+						rebuildVoiceList()
 					})
 				}
 				voiceClient.onMemberLeave = func(nick string) {
@@ -393,7 +510,7 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 								break
 							}
 						}
-						voiceMembersList.Refresh()
+						rebuildVoiceList()
 					})
 				}
 
@@ -410,7 +527,10 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 					currentVoiceChan = fullChan
 					leaveVoiceBtn.Show()
 					voiceMembers = []VoiceMember{{nick: myNick}}
-					voiceMembersList.Refresh()
+					rebuildVoiceList()
+					// Immediately populate cache for room list sidebar so name shows up instantly
+					vcMembersCache.Store(fullChan, []string{myNick})
+					roomsList.Refresh()
 				})
 			}()
 		}
