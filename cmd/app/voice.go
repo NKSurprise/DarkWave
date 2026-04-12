@@ -383,8 +383,9 @@ func (vc *VoiceClient) RestartAudio() {
 		}
 	}
 
-	// Give old captureMic goroutine time to exit before relaunching.
-	time.Sleep(80 * time.Millisecond)
+	// Give old captureMic goroutines time to exit before relaunching.
+	// Extended sleep to ensure all goroutines are fully cleaned up
+	time.Sleep(150 * time.Millisecond)
 
 	vc.mu.Lock()
 	micTracks := make([]*webrtc.TrackLocalStaticSample, len(vc.micTracks))
@@ -430,6 +431,11 @@ func (vc *VoiceClient) send(msg SignalMsg) {
 }
 
 func (vc *VoiceClient) readLoop() {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Printf("VOICE: readLoop PANIC: %v\n", r)
+		}
+	}()
 	for {
 		_, data, err := vc.ws.ReadMessage()
 		if err != nil {
@@ -570,6 +576,12 @@ func (vc *VoiceClient) initiateCall(targetNick string) {
 		fmt.Printf("VOICE: ICE connection state changed to: %s (with %s)\n", connectionState.String(), targetNick)
 	})
 
+	// handle incoming audio
+	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		fmt.Println("VOICE: OnTrack fired (initiator), codec:", track.Codec().MimeType)
+		go vc.playAudio(targetNick, track)
+	})
+
 	// add audio track
 	audioTrack, err := webrtc.NewTrackLocalStaticSample(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
@@ -588,10 +600,6 @@ func (vc *VoiceClient) initiateCall(targetNick string) {
 	vc.mu.Unlock()
 	// start mic capture to this track
 	go vc.captureMic(audioTrack)
-
-	// NOTE: DO NOT add OnTrack handler here - initiator sends only, responder receives
-	// This prevents self-loop echo where your audio gets routed back to you
-	// Only the answerer (handleOffer) will have OnTrack to receive remote audio
 
 	// relay ICE candidates
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
@@ -662,7 +670,7 @@ func (vc *VoiceClient) handleOffer(fromNick, payload string) {
 		// handle incoming audio
 		pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 			fmt.Println("VOICE: OnTrack fired, codec:", track.Codec().MimeType)
-			go vc.playAudio(track)
+			go vc.playAudio(fromNick, track)
 		})
 
 		// relay ICE candidates
@@ -1099,8 +1107,8 @@ func (vc *VoiceClient) captureMic(track *webrtc.TrackLocalStaticSample) {
 	}
 }
 
-func (vc *VoiceClient) playAudio(track *webrtc.TrackRemote) {
-	fmt.Println("VOICE: playAudio started, codec:", track.Codec().MimeType)
+func (vc *VoiceClient) playAudio(peerNick string, track *webrtc.TrackRemote) {
+	fmt.Println("VOICE: playAudio started for", peerNick, "codec:", track.Codec().MimeType)
 	sampleRate := 48000
 	channels := 1
 	framesPerBuffer := 960
@@ -1128,21 +1136,41 @@ func (vc *VoiceClient) playAudio(track *webrtc.TrackRemote) {
 
 		framesReceived++
 		if framesReceived%100 == 0 {
-			fmt.Printf("VOICE: playAudio received %d RTP frames, first decoded sample: %d\n", framesReceived, buf[0])
+			fmt.Printf("VOICE: playAudio received %d RTP frames from %s, first decoded sample: %d\n", framesReceived, peerNick, buf[0])
 		}
 
 		// Copy the decoded audio before sending to avoid buffer reuse issues
 		audioCopy := make([]int16, len(buf))
 		copy(audioCopy, buf)
 
+		// Apply per-peer volume adjustment
+		peerVolume := vc.GetPeerVolume(peerNick)
+		if peerVolume != 1.0 {
+			for i := range audioCopy {
+				val := float32(audioCopy[i]) * peerVolume
+				if val > 32767 {
+					audioCopy[i] = 32767
+				} else if val < -32768 {
+					audioCopy[i] = -32768
+				} else {
+					audioCopy[i] = int16(val)
+				}
+			}
+		}
+
 		// Send decoded audio to playback manager
+		// Check isConnected again to avoid sending to closed channel
+		if !vc.isConnected {
+			return
+		}
+
 		// Non-blocking send to avoid deadlock if queue is full
 		select {
 		case vc.audioQueue <- audioCopy:
 			// Sent successfully
 		default:
 			// Queue full, drop frame to maintain responsiveness
-			fmt.Println("VOICE: audio queue full, dropping frame")
+			fmt.Println("VOICE: audio queue full, dropping frame from", peerNick)
 		}
 	}
 }
