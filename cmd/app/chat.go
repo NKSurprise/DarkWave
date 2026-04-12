@@ -289,7 +289,9 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 
 	var currentVoiceChan string // full key e.g. "general/Voice"
 	var leaveVoiceBtn *widget.Button
-	leaveVoiceBtn = widget.NewButton("🔇 Leave Voice", func() {
+
+	// Helper function to properly leave voice channel (used by both button and auto-disconnect)
+	leaveCurrentVoiceChannel := func() {
 		if voiceClient != nil {
 			voiceClient.LeaveChannel()
 			voiceClient = nil
@@ -312,6 +314,10 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 		rebuildVoiceList()
 		roomsList.Refresh()
 		leaveVoiceBtn.Hide()
+	}
+
+	leaveVoiceBtn = widget.NewButton("🔇 Leave Voice", func() {
+		leaveCurrentVoiceChannel()
 	})
 	leaveVoiceBtn.Hide()
 
@@ -465,12 +471,38 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 			}
 			r := roomsWithVoice[item.roomIdx]
 			channelName := item.chanName
+
+			// Deselect immediately so user can rejoin the same channel if they leave and come back
+			roomsList.Unselect(i)
+
 			go func() {
+				// Automatically leave current VC if in one
 				if voiceClient != nil {
 					savedInputDeviceName = voiceClient.inputDeviceName
 					savedOutputDeviceName = voiceClient.outputDeviceName
 					voiceClient.LeaveChannel()
 					voiceClient = nil
+
+					// Update UI for leaving
+					if currentVoiceChan != "" {
+						if raw, ok := vcMembersCache.Load(currentVoiceChan); ok {
+							old := raw.([]string)
+							updated := make([]string, 0, len(old))
+							for _, n := range old {
+								if n != myNick {
+									updated = append(updated, n)
+								}
+							}
+							vcMembersCache.Store(currentVoiceChan, updated)
+						}
+						currentVoiceChan = ""
+					}
+					voiceMembers = []VoiceMember{}
+					fyne.Do(func() {
+						rebuildVoiceList()
+						roomsList.Refresh()
+						leaveVoiceBtn.Hide()
+					})
 				}
 
 				// Load saved device preferences if not already stored
