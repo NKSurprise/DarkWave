@@ -73,7 +73,7 @@ func NewVoiceClient(myNick string) *VoiceClient {
 	return &VoiceClient{
 		myNick:             myNick,
 		pc:                 make(map[string]*webrtc.PeerConnection),
-		agcTargetLevel:     5000, // target RMS in int16 scale (lowered to prevent echo amplification)
+		agcTargetLevel:     3000, // target RMS in int16 scale (lowered to prevent echo amplification)
 		agcCurrentGain:     1.0,  // start with unity gain
 		iceCandidateQueues: make(map[string][]*webrtc.ICECandidateInit),
 		peerVolumes:        make(map[string]float32), // initialize peer volumes map
@@ -843,10 +843,10 @@ func (vc *VoiceClient) applyAGC(buf []float32, targetRMS float32) {
 	// Calculate desired gain to reach target RMS
 	desiredGain := targetRMS / rms
 
-	// Clamp gain: allow 0.7x to 2.5x (very conservative)
+	// Clamp gain: allow 0.7x to 1.5x (conservative to prevent echo amplification)
 	// This just smooths out volume variations, not aggressive normalization
-	if desiredGain > 2.5 {
-		desiredGain = 2.5 // up to +8dB
+	if desiredGain > 1.5 {
+		desiredGain = 1.5 // up to ~3.5dB
 	} else if desiredGain < 0.7 {
 		desiredGain = 0.7 // down to -3dB
 	}
@@ -1051,8 +1051,8 @@ func (vc *VoiceClient) captureMic(track *webrtc.TrackLocalStaticSample) {
 			buf[i] = int16(f)
 		}
 
-		// VAD: threshold (0.7) to filter out echo and background noise without cutting speech
-		isVoice := vad > 0.7
+		// VAD: threshold (0.8) to filter out echo and background noise without cutting speech
+		isVoice := vad > 0.8
 
 		if frameCount%100 == 0 {
 			fmt.Printf("voice: VAD value: %.4f, isVoice: %v\n", vad, isVoice)
