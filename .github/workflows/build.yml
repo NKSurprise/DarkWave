@@ -45,14 +45,17 @@ jobs:
                      libgcc_s_seh-1.dll libstdc++-6.dll libwinpthread-1.dll; do
             cp /ucrt64/bin/$dll DarkWave-windows/ || true
           done
-          # OpenGL/Mesa DLLs (needed by Fyne on machines without a proper GPU driver)
+          # Mesa fallback DLLs (separate folder, for old PCs/VMs without proper GPU drivers)
+          mkdir DarkWave-windows-mesa-fallback
           for dll in opengl32.dll libgallium_wgl.dll libLLVM-21.dll libSPIRV-Tools.dll; do
-            cp /ucrt64/bin/$dll DarkWave-windows/ || true
+            cp /ucrt64/bin/$dll DarkWave-windows-mesa-fallback/ || true
           done
 
-      - name: Zip Windows build
+      - name: Zip Windows builds
         shell: pwsh
-        run: Compress-Archive -Path DarkWave-windows -DestinationPath DarkWave-windows.zip
+        run: |
+          Compress-Archive -Path DarkWave-windows -DestinationPath DarkWave-windows.zip
+          Compress-Archive -Path DarkWave-windows-mesa-fallback -DestinationPath DarkWave-windows-mesa-fallback.zip
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
@@ -60,11 +63,19 @@ jobs:
           name: DarkWave-windows
           path: DarkWave-windows.zip
 
+      - name: Upload Windows Mesa fallback artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DarkWave-windows-mesa-fallback
+          path: DarkWave-windows-mesa-fallback.zip
+
       - name: Upload to Release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
-          files: DarkWave-windows.zip
+          files: |
+            DarkWave-windows.zip
+            DarkWave-windows-mesa-fallback.zip
 
   build-linux:
     runs-on: ubuntu-latest
