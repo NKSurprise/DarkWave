@@ -142,14 +142,9 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 	)
 
 	// -- MESSAGES --
-	msgList := widget.NewList(
-		func() int { return len(msgs) },
-		func() fyne.CanvasObject { return widget.NewLabel("") },
-		func(i widget.ListItemID, o fyne.CanvasObject) {
-			o.(*widget.Label).SetText(msgs[i])
-			o.(*widget.Label).Wrapping = fyne.TextWrapWord
-		},
-	)
+	msgView := widget.NewRichText()
+	msgView.Wrapping = fyne.TextWrapWord
+	msgScroll := container.NewVScroll(msgView)
 
 	// -- INPUT --
 	input := widget.NewEntry()
@@ -176,7 +171,7 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 	sendBtn.Importance = widget.HighImportance
 
 	inputRow := container.NewBorder(nil, nil, nil, sendBtn, input)
-	chatArea := container.NewBorder(nil, inputRow, nil, nil, msgList)
+	chatArea := container.NewBorder(nil, inputRow, nil, nil, msgScroll)
 
 	// -- ON FRIEND CLICK --
 
@@ -209,7 +204,8 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 		msgs = []string{}
 		members = []string{}
 		membersList.Refresh()
-		msgList.Refresh()
+		msgView.Segments = nil
+		msgView.Refresh()
 		center.Objects = []fyne.CanvasObject{chatArea}
 		center.Refresh()
 		friendsHomeList.Unselect(i)
@@ -326,7 +322,8 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 		msgs = []string{}
 		members = []string{}
 		membersList.Refresh()
-		msgList.Refresh()
+		msgView.Segments = nil
+		msgView.Refresh()
 		// refresh rooms list
 		center.Objects = []fyne.CanvasObject{friendsHome}
 		center.Refresh()
@@ -449,7 +446,8 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 			conn.send("/voicechannels")
 			conn.send("/rooms") // Refresh rooms list after joining
 			msgs = []string{}
-			msgList.Refresh()
+			msgView.Segments = nil
+			msgView.Refresh()
 			center.Objects = []fyne.CanvasObject{chatWithMembers}
 			center.Refresh()
 			chatWithMembers.SetOffset(0.75)
@@ -736,7 +734,8 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 					conn.send("/rooms")
 					leaveBtn.Hide()
 					msgs = []string{}
-					msgList.Refresh()
+					msgView.Segments = nil
+					msgView.Refresh()
 					center.Objects = []fyne.CanvasObject{friendsHome}
 					center.Refresh()
 					pollChansMu.Lock()
@@ -767,8 +766,12 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 					}
 				}
 				msgs = append(msgs, msg)
-				msgList.Refresh()
-				msgList.ScrollToBottom()
+				msgView.Segments = append(msgView.Segments, &widget.TextSegment{
+					Text:  msg + "\n",
+					Style: widget.RichTextStyleInline,
+				})
+				msgView.Refresh()
+				msgScroll.ScrollToBottom()
 			})
 		}
 	}()

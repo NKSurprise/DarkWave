@@ -216,7 +216,7 @@ func (s *Server) handleCommand(c *Client, cmd string, r *bufio.Reader) {
 			s.sendLine(c, "** error fetching recent messages: %v", err)
 		} else {
 			for _, msg := range msgs {
-				s.sendLine(c, "[%s] %s: %s", msg.SentAt.Format("15:04"), msg.Nick, msg.Body)
+				s.sendLine(c, "[%s] %s: %s", msg.SentAt.Format("02/01 15:04"), msg.Nick, msg.Body)
 			}
 		}
 	case "/join":
@@ -254,7 +254,7 @@ func (s *Server) handleCommand(c *Client, cmd string, r *bufio.Reader) {
 			s.sendLine(c, "** error fetching recent messages: %v", err)
 		} else {
 			for _, msg := range msgs {
-				s.sendLine(c, "[%s] %s: %s", msg.SentAt.Format("15:04"), msg.Nick, msg.Body)
+				s.sendLine(c, "[%s] %s: %s", msg.SentAt.Format("02/01 15:04"), msg.Nick, msg.Body)
 			}
 		}
 	case "/friends":
@@ -414,7 +414,7 @@ func (s *Server) handleCommand(c *Client, cmd string, r *bufio.Reader) {
 			s.sendLine(c, "** error fetching recent messages: %v", err)
 		} else {
 			for _, msg := range msgs {
-				s.sendLine(c, "[%s] (%s) %s", msg.SentAt.Format("15:04"), msg.Nick, msg.Body)
+				s.sendLine(c, "[%s] (%s) %s", msg.SentAt.Format("02/01 15:04"), msg.Nick, msg.Body)
 			}
 		}
 	case "/quit":
