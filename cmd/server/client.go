@@ -39,6 +39,7 @@ func (s *Server) acceptLoop(ctx context.Context) {
 func (s *Server) readLoop(c *Client) {
 	defer func() {
 		s.notifyFriendsOffline(c)
+		s.notifyRoomMembersPresence(c, "offline")
 		s.unregisterClientSingle(c)
 		if c.activeRoom != nil {
 			c.activeRoom.mu.Lock()

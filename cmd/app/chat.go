@@ -107,7 +107,7 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 	var currentRoom string
 	var currentDMKey []byte
 	var isDM bool
-	var members []string
+	var members []FriendStatus
 	var roomsWithVoice []RoomWithVoice
 	var voiceClient *VoiceClient
 	var voiceMembers []VoiceMember
@@ -178,9 +178,21 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 	// -- MEMBERS PANEL --
 	membersList := widget.NewList(
 		func() int { return len(members) },
-		func() fyne.CanvasObject { return widget.NewLabel("") },
+		func() fyne.CanvasObject {
+			dot := widget.NewLabel("●")
+			name := widget.NewLabel("")
+			return container.NewHBox(dot, name)
+		},
 		func(i widget.ListItemID, o fyne.CanvasObject) {
-			o.(*widget.Label).SetText("● " + members[i])
+			row := o.(*fyne.Container)
+			dot := row.Objects[0].(*widget.Label)
+			name := row.Objects[1].(*widget.Label)
+			name.SetText(members[i].nick)
+			if members[i].online {
+				dot.SetText("●")
+			} else {
+				dot.SetText("○")
+			}
 		},
 	)
 
@@ -202,7 +214,7 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 		currentDMKey = deriveKey(myNick, targetNick)
 		isDM = true
 		msgs = []string{}
-		members = []string{}
+		members = []FriendStatus{}
 		membersList.Refresh()
 		msgView.Segments = nil
 		msgView.Refresh()
@@ -320,7 +332,7 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 	leaveBtn := widget.NewButton("🚪 Leave Room", func() {
 		conn.send("/leave")
 		msgs = []string{}
-		members = []string{}
+		members = []FriendStatus{}
 		membersList.Refresh()
 		msgView.Segments = nil
 		msgView.Refresh()
@@ -434,7 +446,7 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 			currentRoom = r.name
 			isDM = false
 			currentDMKey = nil
-			members = []string{}
+			members = []FriendStatus{}
 			membersList.Refresh()
 
 			// Clear all voice channels (we'll fetch new ones for current room only)
@@ -568,7 +580,7 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 	friendsBtn := widget.NewButton("👥 Friends", func() {
 		isDM = false
 		currentDMKey = nil
-		members = []string{}
+		members = []FriendStatus{}
 		membersList.Refresh()
 		roomsList.UnselectAll()
 		leaveBtn.Hide()
@@ -703,13 +715,53 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 				}
 				if strings.HasPrefix(msg, "** members: ") {
 					raw := strings.TrimPrefix(msg, "** members: ")
-					members = strings.Split(raw, ", ")
+					nicks := strings.Split(raw, ", ")
+					members = make([]FriendStatus, len(nicks))
+					for i, nick := range nicks {
+						members[i] = FriendStatus{nick: nick, online: false}
+					}
 					membersList.Refresh()
+					return
+				}
+				if strings.HasPrefix(msg, "** online: ") {
+					raw := strings.TrimPrefix(msg, "** online: ")
+					onlineSet := make(map[string]bool)
+					for _, nick := range strings.Split(raw, ", ") {
+						onlineSet[nick] = true
+					}
+					for i, m := range members {
+						members[i].online = onlineSet[m.nick]
+					}
+					membersList.Refresh()
+					return
+				}
+				if strings.HasPrefix(msg, "** presence: ") {
+					parts := strings.Fields(strings.TrimPrefix(msg, "** presence: "))
+					if len(parts) == 2 {
+						nick, status := parts[0], parts[1]
+						for i, m := range members {
+							if m.nick == nick {
+								members[i].online = status == "online"
+								break
+							}
+						}
+						membersList.Refresh()
+					}
 					return
 				}
 				if strings.HasPrefix(msg, "** joined: ") {
 					nick := strings.TrimPrefix(msg, "** joined: ")
-					members = append(members, nick)
+					found := false
+					for i, m := range members {
+						if m.nick == nick {
+							members[i].online = true
+							found = true
+							break
+						}
+					}
+					if !found {
+						members = append(members, FriendStatus{nick: nick, online: true})
+					}
 					membersList.Refresh()
 					return
 				}
@@ -719,8 +771,8 @@ func chatScreen(w fyne.Window, conn *Connection, myNick string, serverAddr strin
 				if strings.HasPrefix(msg, "** left: ") {
 					nick := strings.TrimPrefix(msg, "** left: ")
 					for i, m := range members {
-						if m == nick {
-							members = append(members[:i], members[i+1:]...)
+						if m.nick == nick {
+							members[i].online = false
 							break
 						}
 					}

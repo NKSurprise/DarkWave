@@ -179,6 +179,7 @@ func (s *Server) handleCommand(c *Client, cmd string, r *bufio.Reader) {
 		s.sendLine(c, "** welcome, %s!", retNick)
 		s.registerClientSingle(c)
 		s.notifyFriendsOnline(c)
+		s.notifyRoomMembersPresence(c, "online")
 
 		// Ensure #main room exists in database with correct ID
 		mainID, mainName, err := s.repo.UpsertRoomByName(context.Background(), "#main", id)
