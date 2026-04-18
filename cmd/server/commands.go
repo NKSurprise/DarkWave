@@ -3,7 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
-	argon2stuff "darkwave/passwordHandling"
+	argon2stuff "darkwave/cmd/server/passwordHandling"
 	"fmt"
 	"strings"
 )
