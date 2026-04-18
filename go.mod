@@ -8,6 +8,7 @@ require (
 	fyne.io/fyne/v2 v2.7.3
 	github.com/gordonklaus/portaudio v0.0.0-20260203164431-765aa7dfa631
 	github.com/gorilla/websocket v1.5.3
+	github.com/hraban/opus v0.0.0-20251117090126-c76ea7e21bf3
 	github.com/jackc/pgx/v5 v5.8.0
 	github.com/joho/godotenv v1.5.1
 	github.com/pion/webrtc/v3 v3.3.6
@@ -32,7 +33,6 @@ require (
 	github.com/google/uuid v1.3.1 // indirect
 	github.com/hack-pad/go-indexeddb v0.3.2 // indirect
 	github.com/hack-pad/safejs v0.1.0 // indirect
-	github.com/hraban/opus v0.0.0-20251117090126-c76ea7e21bf3 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
