@@ -87,6 +87,31 @@ func (s *Server) notifyFriendsOffline(c *Client) {
 	}
 }
 
+// notifyRoomMembersPresence broadcasts a presence update to all clients currently
+// occupying any room that c has access to (excluding c itself).
+func (s *Server) notifyRoomMembersPresence(c *Client, status string) {
+	ctx := context.Background()
+	roomNames, err := s.repo.getUserRooms(ctx, c.UserID)
+	if err != nil {
+		return
+	}
+	for _, roomName := range roomNames {
+		s.mu.RLock()
+		r, ok := s.rooms[roomName]
+		s.mu.RUnlock()
+		if !ok {
+			continue
+		}
+		r.mu.RLock()
+		for roomClient := range r.clients {
+			if roomClient != c {
+				s.sendLine(roomClient, "** presence: %s %s", c.nick, status)
+			}
+		}
+		r.mu.RUnlock()
+	}
+}
+
 func (s *Server) broadcastToRoom(r *Room, msg string) {
 	if r == nil {
 		return

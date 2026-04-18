@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
@@ -81,9 +82,26 @@ func (s *Server) joinRoom(c *Client, r *Room) {
 	r.mu.Unlock()
 	c.activeRoom = r
 
-	// send current members to joining client
-	nicks := r.memberNicks()
-	s.sendLine(c, "** members: %s", strings.Join(nicks, ", "))
+	// Send all users who have access to this room (from DB)
+	allMembers, err := s.repo.getRoomMembers(context.Background(), r.ID)
+	if err != nil || len(allMembers) == 0 {
+		// Fallback: just send currently connected nicks
+		nicks := r.memberNicks()
+		s.sendLine(c, "** members: %s", strings.Join(nicks, ", "))
+	} else {
+		s.sendLine(c, "** members: %s", strings.Join(allMembers, ", "))
+		// Tell client which of those are currently online (connected to server)
+		onlineSet := s.connectedNicksSet()
+		var onlineNicks []string
+		for _, nick := range allMembers {
+			if onlineSet[nick] {
+				onlineNicks = append(onlineNicks, nick)
+			}
+		}
+		if len(onlineNicks) > 0 {
+			s.sendLine(c, "** online: %s", strings.Join(onlineNicks, ", "))
+		}
+	}
 
 	s.sendLine(c, "** joined %s", r.Name)
 }
@@ -96,4 +114,24 @@ func (r *Room) memberNicks() []string {
 		nicks = append(nicks, c.nick)
 	}
 	return nicks
+}
+
+func (r *Room) memberNicksSet() map[string]bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	set := make(map[string]bool, len(r.clients))
+	for c := range r.clients {
+		set[c.nick] = true
+	}
+	return set
+}
+
+func (s *Server) connectedNicksSet() map[string]bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	set := make(map[string]bool, len(s.clientsByUser))
+	for _, c := range s.clientsByUser {
+		set[c.nick] = true
+	}
+	return set
 }
